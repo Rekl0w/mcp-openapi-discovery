@@ -9,6 +9,10 @@
 
 It is designed for documentation-first API workflows where you want an MCP client to move from **"find the spec"** to **"understand the endpoint"** to **"call the endpoint"**.
 
+Published package:
+
+- npm: [@rekl0w/mcp-openapi-discovery](https://www.npmjs.com/package/@rekl0w/mcp-openapi-discovery)
+
 ## Why this project exists
 
 Many APIs expose documentation pages, but not always the raw spec URL directly. This server helps bridge that gap by discovering the OpenAPI document behind a docs page and turning it into callable MCP tools.
@@ -62,6 +66,14 @@ It is especially useful for:
 
 ## Installation
 
+Install from npm:
+
+```bash
+npm i @rekl0w/mcp-openapi-discovery
+```
+
+Or install project dependencies when working from source:
+
 ```bash
 npm install
 npm run build
@@ -83,7 +95,54 @@ npm run dev
 
 ## Connecting from an MCP client
 
-Before publishing to npm, you can connect the local build directly from your MCP client.
+The easiest way to use the published package in MCP clients is to let the client auto-install and run it through `npx`.
+
+### Auto-install from npm with `npx`
+
+If your MCP client supports a `command` + `args` stdio server definition, use:
+
+```json
+{
+  "command": "npx",
+  "args": ["-y", "@rekl0w/mcp-openapi-discovery"]
+}
+```
+
+This is usually the cleanest setup for clients such as VS Code and Cursor-like MCP clients because the package is downloaded automatically when the server starts.
+
+### VS Code (`.vscode/mcp.json`)
+
+VS Code supports `mcp.json` and can run local MCP servers through `npx`.
+
+```json
+{
+  "servers": {
+    "openapi-discovery": {
+      "command": "npx",
+      "args": ["-y", "@rekl0w/mcp-openapi-discovery"]
+    }
+  }
+}
+```
+
+### Cursor-style MCP config
+
+For MCP clients that use a JSON config with `mcpServers`, a typical setup looks like this:
+
+```json
+{
+  "mcpServers": {
+    "openapi-discovery": {
+      "command": "npx",
+      "args": ["-y", "@rekl0w/mcp-openapi-discovery"]
+    }
+  }
+}
+```
+
+### Local build instead of npm
+
+If you prefer to run the local build directly instead of using npm, point your MCP client at `dist/index.js`.
 
 ### Claude Desktop example (Windows)
 
