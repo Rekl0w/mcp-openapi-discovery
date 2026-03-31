@@ -3,6 +3,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import {
   detectOpenApi,
+  formatCallSequenceResult,
   formatEndpointSearchResults,
   formatDiscoverySummary,
   formatEndpointDetail,
@@ -13,6 +14,7 @@ import {
   listOpenApiEndpoints,
   findRelatedEndpoints,
   searchOpenApiEndpoints,
+  suggestCallSequence,
   traceParameterUsage,
 } from "./openapi.js";
 import { callOpenApiEndpoint, formatCallEndpointResult } from "./request.js";
@@ -40,7 +42,7 @@ export function createServer(): McpServer {
   const server = new McpServer(
     {
       name: "mcp-openapi-discovery",
-      version: "0.1.0",
+      version: "0.3.0",
     },
     {
       capabilities: {
@@ -209,6 +211,88 @@ export function createServer(): McpServer {
       } catch (error) {
         return createErrorResult(
           error instanceof Error ? error.message : "Endpoint search failed.",
+        );
+      }
+    },
+  );
+
+  server.registerTool(
+    "suggest_call_sequence",
+    {
+      description:
+        "Suggest a likely API call sequence for reaching a target endpoint or accomplishing a goal, such as creating prerequisites before creating a dependent resource.",
+      inputSchema: {
+        specId: z.string().describe("Spec ID returned by detect_openapi"),
+        goal: z
+          .string()
+          .optional()
+          .describe(
+            "Optional natural-language goal, e.g. create product with category and attributes",
+          ),
+        targetMethod: z
+          .enum([
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS",
+            "HEAD",
+            "TRACE",
+          ])
+          .optional()
+          .describe(
+            "Exact target HTTP method when planning from a known endpoint",
+          ),
+        targetPath: z
+          .string()
+          .optional()
+          .describe(
+            "Exact target OpenAPI path when planning from a known endpoint",
+          ),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional()
+          .describe(
+            "Maximum number of workflow suggestions to return; defaults to 3",
+          ),
+        maxDepth: z
+          .number()
+          .int()
+          .min(1)
+          .max(8)
+          .optional()
+          .describe("Maximum dependency depth to explore; defaults to 5"),
+      },
+    },
+    async ({ specId, goal, targetMethod, targetPath, limit, maxDepth }) => {
+      try {
+        const result = await suggestCallSequence({
+          specId,
+          goal,
+          targetMethod,
+          targetPath,
+          limit,
+          maxDepth,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatCallSequenceResult(result),
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        } satisfies CallToolResult;
+      } catch (error) {
+        return createErrorResult(
+          error instanceof Error
+            ? error.message
+            : "Workflow suggestion failed.",
         );
       }
     },

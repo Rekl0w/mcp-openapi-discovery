@@ -1,5 +1,12 @@
 import SwaggerParser from "@apidevtools/swagger-parser";
 import { createHash } from "node:crypto";
+import {
+  mkdir,
+  readFile as readFileFromDisk,
+  writeFile,
+} from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 type JsonObject = Record<string, unknown>;
@@ -46,12 +53,19 @@ const ACCEPT_HEADER = [
   "text/html;q=0.9",
 ].join(", ");
 
-const USER_AGENT = "mcp-openapi-discovery/0.1.0";
+const USER_AGENT = "mcp-openapi-discovery/0.3.0";
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_CANDIDATES = 30;
 const MAX_SCHEMA_PROPERTIES = 12;
 const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
+const CACHE_SCHEMA_VERSION = 1;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_DIR_NAME = ".mcp-openapi-discovery-cache";
+const DEFAULT_WORKFLOW_LIMIT = 3;
+const MAX_WORKFLOW_LIMIT = 5;
+const DEFAULT_WORKFLOW_DEPTH = 5;
+const MAX_WORKFLOW_DEPTH = 8;
 const SEARCH_STOP_WORDS = new Set([
   "a",
   "an",
@@ -67,6 +81,24 @@ const SEARCH_STOP_WORDS = new Set([
   "to",
   "with",
 ]);
+const SEARCH_SYNONYM_GROUPS = [
+  ["create", "add", "new", "insert", "register"],
+  ["update", "edit", "modify", "patch"],
+  ["delete", "remove", "destroy"],
+  ["list", "search", "find", "browse", "all"],
+  ["get", "fetch", "show", "detail"],
+  ["auth", "authenticate", "login", "signin", "token", "oauth"],
+  ["upload", "file", "attachment", "media"],
+] as const;
+
+type OperationKind =
+  | "auth"
+  | "create"
+  | "list"
+  | "get"
+  | "update"
+  | "delete"
+  | "action";
 
 export interface DiscoverySummary {
   specId: string;
@@ -226,6 +258,33 @@ export interface EndpointSearchMatch extends EndpointSummary {
   matchedTerms: string[];
 }
 
+export interface CallSequenceStep {
+  step: number;
+  method: Uppercase<HttpMethod>;
+  path: string;
+  operationId?: string;
+  summary?: string;
+  operationKind: OperationKind;
+  reasons: string[];
+  produces: string[];
+  consumes: string[];
+}
+
+export interface WorkflowSuggestion {
+  target: EndpointSummary;
+  confidence: number;
+  coveredDependencies: string[];
+  missingDependencies: string[];
+  steps: CallSequenceStep[];
+}
+
+export interface CallSequenceResult {
+  discovery: DiscoverySummary;
+  goal?: string;
+  targetCandidates?: EndpointSearchMatch[];
+  workflows: WorkflowSuggestion[];
+}
+
 interface CandidateUrl {
   url: string;
   source: DiscoverySummary["source"];
@@ -252,15 +311,62 @@ interface ResolvedDocument {
   document: OpenApiDocument;
   endpoints: EndpointSummary[];
   searchDocuments: EndpointSearchDocument[];
+  workflowDocuments: WorkflowDocument[];
 }
 
 interface EndpointSearchDocument {
   endpoint: EndpointSummary;
   searchText: string;
   primaryTokens: string[];
+  pathTokens: string[];
+  operationTokens: string[];
+  tagTokens: string[];
   parameterTokens: string[];
   requestTokens: string[];
   responseTokens: string[];
+  requestFieldDepths: Record<string, number>;
+  responseFieldDepths: Record<string, number>;
+  operationKind: OperationKind;
+}
+
+interface StructuredFieldDescriptor {
+  fieldName: string;
+  fieldPath: string;
+  normalizedName: string;
+  required: boolean;
+  depth: number;
+}
+
+interface WorkflowSignal {
+  name: string;
+  normalizedName: string;
+  aliases: string[];
+  source:
+    | "path-parameter"
+    | "query-parameter"
+    | "request-body"
+    | "response-body"
+    | "auth";
+  required: boolean;
+  depth: number;
+}
+
+interface WorkflowDocument {
+  key: string;
+  endpoint: EndpointDetail;
+  operationKind: OperationKind;
+  isAuthEndpoint: boolean;
+  resourceTokens: string[];
+  requiredInputs: WorkflowSignal[];
+  optionalInputs: WorkflowSignal[];
+  producedOutputs: WorkflowSignal[];
+}
+
+interface CachedDocumentRecord {
+  schemaVersion: number;
+  cachedAt: string;
+  normalizedInput: string;
+  resolved: ResolvedDocument;
 }
 
 type OpenApiDocument = JsonObject & {
@@ -360,7 +466,7 @@ export async function searchOpenApiEndpoints(
   totalMatches: number;
   endpoints: EndpointSearchMatch[];
 }> {
-  const resolved = specCache.get(specId);
+  const resolved = await loadResolvedDocumentBySpecId(specId);
 
   if (!resolved) {
     throw new Error(
@@ -368,8 +474,8 @@ export async function searchOpenApiEndpoints(
     );
   }
 
-  const queryTokens = tokenizeSearchText(query);
-  if (queryTokens.length === 0) {
+  const searchTerms = buildSearchTerms(query);
+  if (searchTerms.length === 0) {
     throw new Error("Search query must include at least one searchable term.");
   }
 
@@ -381,6 +487,7 @@ export async function searchOpenApiEndpoints(
     Math.min(filters.limit ?? DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
   );
   const normalizedPhrase = normalizeSearchText(query).trim();
+  const desiredOperationKinds = inferDesiredOperationKinds(searchTerms);
 
   const matches = resolved.searchDocuments
     .filter(({ endpoint }) => {
@@ -402,7 +509,12 @@ export async function searchOpenApiEndpoints(
       return true;
     })
     .map((searchDocument) =>
-      scoreSearchDocument(searchDocument, queryTokens, normalizedPhrase),
+      scoreSearchDocument(
+        searchDocument,
+        searchTerms,
+        normalizedPhrase,
+        desiredOperationKinds,
+      ),
     )
     .filter(
       (
@@ -432,6 +544,98 @@ export async function searchOpenApiEndpoints(
       score: match.score,
       matchedTerms: match.matchedTerms,
     })),
+  };
+}
+
+export async function suggestCallSequence(input: {
+  specId: string;
+  targetMethod?: string;
+  targetPath?: string;
+  goal?: string;
+  limit?: number;
+  maxDepth?: number;
+}): Promise<CallSequenceResult> {
+  const resolved = await loadResolvedDocumentBySpecId(input.specId);
+
+  if (!resolved) {
+    throw new Error(
+      `Unknown specId: ${input.specId}. Run detect_openapi first so the spec is loaded into server memory.`,
+    );
+  }
+
+  const maxDepth = Math.max(
+    1,
+    Math.min(input.maxDepth ?? DEFAULT_WORKFLOW_DEPTH, MAX_WORKFLOW_DEPTH),
+  );
+  const limit = Math.max(
+    1,
+    Math.min(input.limit ?? DEFAULT_WORKFLOW_LIMIT, MAX_WORKFLOW_LIMIT),
+  );
+
+  let targetCandidates: EndpointSearchMatch[] | undefined;
+  let targets: EndpointSummary[] = [];
+  let targetRank = new Map<string, number>();
+
+  if (input.goal?.trim()) {
+    const searchResult = await searchOpenApiEndpoints(
+      input.specId,
+      input.goal,
+      {
+        limit,
+      },
+    );
+    targetCandidates = searchResult.endpoints;
+    targets = targetCandidates;
+    targetRank = new Map(
+      targetCandidates.map((candidate, index) => [
+        `${candidate.method} ${candidate.path}`,
+        index,
+      ]),
+    );
+  } else {
+    const normalizedMethod = normalizeMethod(input.targetMethod);
+    if (!normalizedMethod || !input.targetPath) {
+      throw new Error(
+        "Provide either goal, or both targetMethod and targetPath.",
+      );
+    }
+
+    const target = resolved.endpoints.find(
+      (endpoint) =>
+        endpoint.method === normalizedMethod &&
+        endpoint.path === input.targetPath,
+    );
+
+    if (!target) {
+      throw new Error(
+        `Target endpoint not found for ${normalizedMethod} ${input.targetPath}`,
+      );
+    }
+
+    targets = [target];
+  }
+
+  const workflows = targets
+    .map((target) => buildWorkflowSuggestion(resolved, target, maxDepth))
+    .filter((workflow): workflow is WorkflowSuggestion => Boolean(workflow))
+    .sort(
+      (left, right) =>
+        (targetRank.get(`${left.target.method} ${left.target.path}`) ??
+          Number.MAX_SAFE_INTEGER) -
+          (targetRank.get(`${right.target.method} ${right.target.path}`) ??
+            Number.MAX_SAFE_INTEGER) ||
+        right.confidence - left.confidence ||
+        left.missingDependencies.length - right.missingDependencies.length ||
+        left.target.path.localeCompare(right.target.path) ||
+        left.target.method.localeCompare(right.target.method),
+    )
+    .slice(0, limit);
+
+  return {
+    discovery: resolved.discovery,
+    goal: input.goal,
+    targetCandidates,
+    workflows,
   };
 }
 
@@ -1041,6 +1245,68 @@ export function formatEndpointSearchResults(result: {
   return lines.join("\n");
 }
 
+export function formatCallSequenceResult(result: CallSequenceResult): string {
+  const lines = [
+    `API: ${result.discovery.apiTitle}`,
+    result.goal ? `Goal: ${result.goal}` : "Workflow suggestion:",
+  ];
+
+  if (result.targetCandidates && result.targetCandidates.length > 0) {
+    lines.push("Target candidates:");
+    for (const candidate of result.targetCandidates) {
+      lines.push(
+        `- ${candidate.method} ${candidate.path} (score: ${candidate.score.toFixed(2)})${candidate.summary ? ` — ${candidate.summary}` : ""}`,
+      );
+    }
+  }
+
+  if (result.workflows.length === 0) {
+    lines.push(
+      "No workflow suggestions could be built for the requested target.",
+    );
+    return lines.join("\n");
+  }
+
+  for (const workflow of result.workflows) {
+    lines.push("");
+    lines.push(
+      `Target: ${workflow.target.method} ${workflow.target.path} (confidence: ${workflow.confidence.toFixed(2)})`,
+    );
+
+    if (workflow.coveredDependencies.length > 0) {
+      lines.push(
+        `Covered dependencies: ${workflow.coveredDependencies.join(", ")}`,
+      );
+    }
+
+    if (workflow.missingDependencies.length > 0) {
+      lines.push(
+        `Missing dependencies: ${workflow.missingDependencies.join(", ")}`,
+      );
+    }
+
+    for (const step of workflow.steps) {
+      lines.push(
+        `${step.step}. ${step.method} ${step.path}${step.summary ? ` — ${step.summary}` : ""}`,
+      );
+
+      if (step.reasons.length > 0) {
+        lines.push(`   why: ${step.reasons.join(" • ")}`);
+      }
+
+      if (step.consumes.length > 0) {
+        lines.push(`   consumes: ${step.consumes.join(", ")}`);
+      }
+
+      if (step.produces.length > 0) {
+        lines.push(`   produces: ${step.produces.join(", ")}`);
+      }
+    }
+  }
+
+  return lines.join("\n");
+}
+
 interface SearchNeedles {
   raw: string;
   normalized: string;
@@ -1523,6 +1789,23 @@ function isPathRelated(leftPath: string, rightPath: string): boolean {
   return left.startsWith(right) || right.startsWith(left);
 }
 
+async function loadResolvedDocumentBySpecId(
+  specId: string,
+): Promise<ResolvedDocument | undefined> {
+  const cached = specCache.get(specId);
+  if (cached) {
+    return cached;
+  }
+
+  const persisted = await readCachedDocumentBySpecId(specId);
+  if (!persisted) {
+    return undefined;
+  }
+
+  hydrateResolvedDocument(persisted.normalizedInput, persisted.resolved);
+  return persisted.resolved;
+}
+
 async function loadResolvedDocument(
   inputUrl: string,
 ): Promise<ResolvedDocument> {
@@ -1531,6 +1814,14 @@ async function loadResolvedDocument(
 
   if (cached) {
     return cached;
+  }
+
+  const persisted = await readCachedDocumentByInput(normalizedInput);
+  if (persisted) {
+    hydrateResolvedDocument(normalizedInput, persisted.resolved);
+    const hydrated = Promise.resolve(persisted.resolved);
+    documentCache.set(normalizedInput, hydrated);
+    return persisted.resolved;
   }
 
   const promise = discoverOpenApiDocument(normalizedInput).catch((error) => {
@@ -1572,25 +1863,29 @@ async function discoverOpenApiDocument(
         fetched.finalUrl,
         directSpec.doc,
       );
-      return buildResolvedDocument(
+      const resolved = buildResolvedDocument(
         candidate,
         fetched.finalUrl,
         directSpec,
         bundledDoc,
         inputUrl,
       );
+      await persistResolvedDocument(inputUrl, resolved);
+      return resolved;
     }
 
     if (looksLikeHtml(fetched.body, fetched.contentType)) {
       const inlineSpec = extractInlineOpenApiDocument(fetched.body);
       if (inlineSpec) {
-        return buildResolvedDocument(
+        const resolved = buildResolvedDocument(
           { ...candidate, source: "inline-html", pageUrl: fetched.finalUrl },
           fetched.finalUrl,
           inlineSpec,
           inlineSpec.doc,
           inputUrl,
         );
+        await persistResolvedDocument(inputUrl, resolved);
+        return resolved;
       }
 
       for (const nextCandidate of extractCandidateUrlsFromHtml(
@@ -1619,6 +1914,7 @@ function buildResolvedDocument(
 ): ResolvedDocument {
   const specId = buildSpecId(documentUrl);
   const endpoints = extractEndpoints(doc);
+  const workflowDocuments = buildWorkflowDocuments(doc, documentUrl);
   const tags = Array.isArray(doc.tags)
     ? doc.tags
         .map((tag: unknown) =>
@@ -1653,12 +1949,96 @@ function buildResolvedDocument(
     discovery,
     document: doc,
     endpoints,
-    searchDocuments: buildEndpointSearchDocuments(doc, documentUrl),
+    searchDocuments: buildEndpointSearchDocuments(
+      doc,
+      documentUrl,
+      workflowDocuments,
+    ),
+    workflowDocuments,
   };
 
-  specCache.set(specId, resolved);
+  hydrateResolvedDocument(inputUrl, resolved);
 
   return resolved;
+}
+
+function hydrateResolvedDocument(
+  normalizedInput: string,
+  resolved: ResolvedDocument,
+): void {
+  specCache.set(resolved.specId, resolved);
+  documentCache.set(normalizedInput, Promise.resolve(resolved));
+}
+
+async function readCachedDocumentByInput(
+  normalizedInput: string,
+): Promise<CachedDocumentRecord | undefined> {
+  return readCachedDocument(getInputCacheFilePath(normalizedInput));
+}
+
+async function readCachedDocumentBySpecId(
+  specId: string,
+): Promise<CachedDocumentRecord | undefined> {
+  return readCachedDocument(getSpecCacheFilePath(specId));
+}
+
+async function readCachedDocument(
+  filePath: string,
+): Promise<CachedDocumentRecord | undefined> {
+  try {
+    const raw = await readFileFromDisk(filePath, "utf8");
+    const parsed = JSON.parse(raw) as CachedDocumentRecord;
+    if (
+      parsed.schemaVersion !== CACHE_SCHEMA_VERSION ||
+      !parsed.cachedAt ||
+      Date.now() - Date.parse(parsed.cachedAt) > CACHE_TTL_MS
+    ) {
+      return undefined;
+    }
+
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+async function persistResolvedDocument(
+  normalizedInput: string,
+  resolved: ResolvedDocument,
+): Promise<void> {
+  const cacheRecord: CachedDocumentRecord = {
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    cachedAt: new Date().toISOString(),
+    normalizedInput,
+    resolved,
+  };
+
+  const directory = getCacheDirectory();
+  await mkdir(directory, { recursive: true });
+
+  const serialized = JSON.stringify(cacheRecord);
+  await Promise.all([
+    writeFile(getInputCacheFilePath(normalizedInput), serialized, "utf8"),
+    writeFile(getSpecCacheFilePath(resolved.specId), serialized, "utf8"),
+  ]);
+}
+
+function getCacheDirectory(): string {
+  return (
+    process.env.MCP_OPENAPI_DISCOVERY_CACHE_DIR?.trim() ||
+    join(homedir(), CACHE_DIR_NAME)
+  );
+}
+
+function getInputCacheFilePath(normalizedInput: string): string {
+  return join(
+    getCacheDirectory(),
+    `input-${createHash("sha256").update(normalizedInput).digest("hex")}.json`,
+  );
+}
+
+function getSpecCacheFilePath(specId: string): string {
+  return join(getCacheDirectory(), `${specId}.json`);
 }
 
 function buildInitialCandidates(inputUrl: URL): CandidateUrl[] {
@@ -1954,9 +2334,13 @@ function extractEndpoints(doc: OpenApiDocument): EndpointSummary[] {
 function buildEndpointSearchDocuments(
   doc: OpenApiDocument,
   documentUrl: string,
+  workflowDocuments: WorkflowDocument[],
 ): EndpointSearchDocument[] {
   const paths = isObject(doc.paths) ? doc.paths : {};
   const documents: EndpointSearchDocument[] = [];
+  const workflowMap = new Map(
+    workflowDocuments.map((workflow) => [workflow.key, workflow]),
+  );
 
   for (const [path, pathItem] of Object.entries(paths)) {
     if (!isObject(pathItem)) {
@@ -1975,11 +2359,26 @@ function buildEndpointSearchDocuments(
         continue;
       }
 
+      const workflowDocument = workflowMap.get(
+        `${context.endpoint.method} ${context.endpoint.path}`,
+      );
+
       const fields = collectEndpointSearchFields({
         doc,
         pathItem,
         operation,
       });
+      const pathTokens = tokenizeSearchText(path.replace(/[{}]/g, " "));
+      const operationTokens = tokenizeSearchText(
+        [
+          context.endpoint.operationId,
+          context.endpoint.summary,
+          context.endpoint.description,
+        ]
+          .filter(Boolean)
+          .join(" "),
+      );
+      const tagTokens = tokenizeSearchText(context.endpoint.tags.join(" "));
       const primaryText = normalizeSearchText(
         [
           context.endpoint.method,
@@ -2004,9 +2403,15 @@ function buildEndpointSearchDocuments(
         endpoint: context.endpoint,
         searchText,
         primaryTokens: tokenizeSearchText(primaryText),
+        pathTokens,
+        operationTokens,
+        tagTokens,
         parameterTokens: tokenizeSearchText(parameterText),
         requestTokens: tokenizeSearchText(requestText),
         responseTokens: tokenizeSearchText(responseText),
+        requestFieldDepths: toFieldDepthMap(fields.requestDescriptors),
+        responseFieldDepths: toFieldDepthMap(fields.responseDescriptors),
+        operationKind: workflowDocument?.operationKind ?? "action",
       });
     }
   }
@@ -2026,6 +2431,8 @@ function collectEndpointSearchFields(input: {
   parameters: string[];
   request: string[];
   responses: string[];
+  requestDescriptors: StructuredFieldDescriptor[];
+  responseDescriptors: StructuredFieldDescriptor[];
 } {
   const parameters = summarizeParameters(
     input.doc,
@@ -2033,36 +2440,16 @@ function collectEndpointSearchFields(input: {
     input.operation,
   ).flatMap((parameter) => [parameter.name, parameter.schema?.refName]);
 
+  const requestDescriptors = collectRequestFieldDescriptors(
+    input.doc,
+    input.operation,
+  );
   const request = new Set<string>();
+
   const requestBody = resolveMaybeRef(input.doc, input.operation.requestBody);
-
   if (isObject(requestBody) && isObject(requestBody.content)) {
-    for (const [contentType, mediaType] of Object.entries(
-      requestBody.content,
-    )) {
+    for (const contentType of Object.keys(requestBody.content)) {
       request.add(contentType);
-      if (isObject(mediaType)) {
-        for (const fieldPath of collectSchemaFieldPaths({
-          doc: input.doc,
-          schemaValue: mediaType.schema,
-        })) {
-          request.add(fieldPath);
-        }
-      }
-    }
-  }
-
-  const swaggerBodyParameter = extractParametersArray(
-    input.operation.parameters,
-  )
-    .map((parameter) => resolveParameter(input.doc, parameter))
-    .find((parameter) => isObject(parameter) && parameter.in === "body");
-  if (swaggerBodyParameter && isObject(swaggerBodyParameter)) {
-    for (const fieldPath of collectSchemaFieldPaths({
-      doc: input.doc,
-      schemaValue: swaggerBodyParameter.schema,
-    })) {
-      request.add(fieldPath);
     }
   }
 
@@ -2078,6 +2465,15 @@ function collectEndpointSearchFields(input: {
     }
   }
 
+  for (const descriptor of requestDescriptors) {
+    request.add(descriptor.fieldName);
+    request.add(descriptor.fieldPath);
+  }
+
+  const responseDescriptors = collectResponseFieldDescriptors(
+    input.doc,
+    input.operation,
+  );
   const responses = new Set<string>();
   const responseMap = isObject(input.operation.responses)
     ? input.operation.responses
@@ -2094,21 +2490,223 @@ function collectEndpointSearchFields(input: {
       if (!isObject(mediaType)) {
         continue;
       }
-
-      for (const fieldPath of collectSchemaFieldPaths({
-        doc: input.doc,
-        schemaValue: mediaType.schema,
-      })) {
-        responses.add(fieldPath);
-      }
     }
+  }
+
+  for (const descriptor of responseDescriptors) {
+    responses.add(descriptor.fieldName);
+    responses.add(descriptor.fieldPath);
   }
 
   return {
     parameters: parameters.filter((value): value is string => Boolean(value)),
     request: [...request],
     responses: [...responses],
+    requestDescriptors,
+    responseDescriptors,
   };
+}
+
+function buildWorkflowDocuments(
+  doc: OpenApiDocument,
+  documentUrl: string,
+): WorkflowDocument[] {
+  const paths = isObject(doc.paths) ? doc.paths : {};
+  const documents: WorkflowDocument[] = [];
+
+  for (const [path, pathItem] of Object.entries(paths)) {
+    if (!isObject(pathItem)) {
+      continue;
+    }
+
+    for (const method of HTTP_METHODS) {
+      const operation = pathItem[method];
+      if (!isObject(operation)) {
+        continue;
+      }
+
+      const upperMethod = method.toUpperCase() as Uppercase<HttpMethod>;
+      const context = getOperationContext(doc, upperMethod, path, documentUrl);
+      if (!context) {
+        continue;
+      }
+
+      const requestDescriptors = collectRequestFieldDescriptors(doc, operation);
+      const responseDescriptors = collectResponseFieldDescriptors(
+        doc,
+        operation,
+      );
+      const resourceTokens = tokenizePathResources(path);
+      const provisionalKind = inferOperationKind(context.endpoint, false);
+      const isAuthEndpoint = isLikelyAuthEndpoint(
+        context.endpoint,
+        responseDescriptors,
+      );
+      const operationKind = isAuthEndpoint
+        ? "auth"
+        : inferOperationKind(context.endpoint, isAuthEndpoint);
+      const resourceToken = resourceTokens.at(-1);
+
+      const requiredInputs: WorkflowSignal[] = [];
+      const optionalInputs: WorkflowSignal[] = [];
+
+      for (const parameter of context.endpoint.parameters) {
+        const normalizedParameterName = normalizeIdentifier(parameter.name);
+        if (
+          parameter.in !== "path" &&
+          !isLikelyWorkflowDependencyName(normalizedParameterName)
+        ) {
+          continue;
+        }
+
+        const signal = createWorkflowSignalFromParameter(
+          parameter,
+          resourceToken,
+        );
+        if (!signal) {
+          continue;
+        }
+
+        if (parameter.in === "path" || parameter.required) {
+          requiredInputs.push(signal);
+        } else {
+          optionalInputs.push(signal);
+        }
+      }
+
+      for (const descriptor of requestDescriptors) {
+        if (!isLikelyWorkflowDependencyName(descriptor.normalizedName)) {
+          continue;
+        }
+
+        const signal = createWorkflowSignalFromField(
+          descriptor,
+          "request-body",
+          resourceToken,
+          operationKind,
+        );
+        if (descriptor.required) {
+          requiredInputs.push(signal);
+        } else {
+          optionalInputs.push(signal);
+        }
+      }
+
+      if (
+        context.securityRequirements.some(
+          (requirement) => requirement.length > 0,
+        )
+      ) {
+        requiredInputs.push({
+          name: "accessToken",
+          normalizedName: "accesstoken",
+          aliases: ["accesstoken", "token", "bearertoken"],
+          source: "auth",
+          required: true,
+          depth: 0,
+        });
+      }
+
+      const producedOutputs = responseDescriptors.map((descriptor) =>
+        createWorkflowSignalFromField(
+          descriptor,
+          "response-body",
+          resourceToken,
+          operationKind,
+          isAuthEndpoint,
+        ),
+      );
+
+      documents.push({
+        key: `${context.endpoint.method} ${context.endpoint.path}`,
+        endpoint: context.endpoint,
+        operationKind: provisionalKind === "auth" ? "auth" : operationKind,
+        isAuthEndpoint,
+        resourceTokens,
+        requiredInputs: dedupeWorkflowSignals(requiredInputs),
+        optionalInputs: dedupeWorkflowSignals(optionalInputs),
+        producedOutputs: dedupeWorkflowSignals(producedOutputs),
+      });
+    }
+  }
+
+  return documents.sort(
+    (left, right) =>
+      left.endpoint.path.localeCompare(right.endpoint.path) ||
+      left.endpoint.method.localeCompare(right.endpoint.method),
+  );
+}
+
+function collectRequestFieldDescriptors(
+  doc: OpenApiDocument,
+  operation: JsonObject,
+): StructuredFieldDescriptor[] {
+  const fields: StructuredFieldDescriptor[] = [];
+  const requestBody = resolveMaybeRef(doc, operation.requestBody);
+
+  if (isObject(requestBody) && isObject(requestBody.content)) {
+    for (const mediaType of Object.values(requestBody.content)) {
+      if (!isObject(mediaType)) {
+        continue;
+      }
+
+      fields.push(
+        ...collectSchemaFieldDescriptors({
+          doc,
+          schemaValue: mediaType.schema,
+          ancestorRequired: true,
+        }),
+      );
+    }
+
+    return dedupeStructuredFields(fields);
+  }
+
+  const swaggerBodyParameter = extractParametersArray(operation.parameters)
+    .map((parameter) => resolveParameter(doc, parameter))
+    .find((parameter) => isObject(parameter) && parameter.in === "body");
+  if (swaggerBodyParameter && isObject(swaggerBodyParameter)) {
+    fields.push(
+      ...collectSchemaFieldDescriptors({
+        doc,
+        schemaValue: swaggerBodyParameter.schema,
+        ancestorRequired: swaggerBodyParameter.required === true,
+      }),
+    );
+  }
+
+  return dedupeStructuredFields(fields);
+}
+
+function collectResponseFieldDescriptors(
+  doc: OpenApiDocument,
+  operation: JsonObject,
+): StructuredFieldDescriptor[] {
+  const fields: StructuredFieldDescriptor[] = [];
+  const responses = isObject(operation.responses) ? operation.responses : {};
+
+  for (const responseValue of Object.values(responses)) {
+    const response = resolveMaybeRef(doc, responseValue);
+    if (!isObject(response) || !isObject(response.content)) {
+      continue;
+    }
+
+    for (const mediaType of Object.values(response.content)) {
+      if (!isObject(mediaType)) {
+        continue;
+      }
+
+      fields.push(
+        ...collectSchemaFieldDescriptors({
+          doc,
+          schemaValue: mediaType.schema,
+          ancestorRequired: true,
+        }),
+      );
+    }
+  }
+
+  return dedupeStructuredFields(fields);
 }
 
 function collectSchemaFieldPaths(input: {
@@ -2117,6 +2715,22 @@ function collectSchemaFieldPaths(input: {
   currentPath?: string;
   visitedRefs?: Set<string>;
 }): string[] {
+  const fields = collectSchemaFieldDescriptors({
+    ...input,
+    ancestorRequired: true,
+  });
+  return [
+    ...new Set(fields.flatMap((field) => [field.fieldName, field.fieldPath])),
+  ];
+}
+
+function collectSchemaFieldDescriptors(input: {
+  doc: OpenApiDocument;
+  schemaValue: unknown;
+  currentPath?: string;
+  visitedRefs?: Set<string>;
+  ancestorRequired: boolean;
+}): StructuredFieldDescriptor[] {
   const schemaObject = isObject(input.schemaValue)
     ? input.schemaValue
     : undefined;
@@ -2136,39 +2750,48 @@ function collectSchemaFieldPaths(input: {
     visitedRefs.add(ref);
   }
 
-  const fields = new Set<string>();
+  const descriptors: StructuredFieldDescriptor[] = [];
   const properties = isObject(resolved.properties)
     ? resolved.properties
     : undefined;
+  const requiredSet = new Set(readStringArray(resolved.required) ?? []);
 
   if (properties) {
     for (const [propertyName, propertySchema] of Object.entries(properties)) {
       const fieldPath = input.currentPath
         ? `${input.currentPath}.${propertyName}`
         : propertyName;
-      fields.add(propertyName);
-      fields.add(fieldPath);
+      const required = input.ancestorRequired && requiredSet.has(propertyName);
+      descriptors.push({
+        fieldName: propertyName,
+        fieldPath,
+        normalizedName: normalizeIdentifier(propertyName),
+        required,
+        depth: measureFieldDepth(fieldPath),
+      });
 
-      for (const nestedField of collectSchemaFieldPaths({
-        ...input,
-        schemaValue: propertySchema,
-        currentPath: fieldPath,
-        visitedRefs,
-      })) {
-        fields.add(nestedField);
-      }
+      descriptors.push(
+        ...collectSchemaFieldDescriptors({
+          ...input,
+          schemaValue: propertySchema,
+          currentPath: fieldPath,
+          visitedRefs,
+          ancestorRequired: required,
+        }),
+      );
     }
   }
 
   if (isObject(resolved.items)) {
-    for (const nestedField of collectSchemaFieldPaths({
-      ...input,
-      schemaValue: resolved.items,
-      currentPath: input.currentPath ? `${input.currentPath}[]` : "[]",
-      visitedRefs,
-    })) {
-      fields.add(nestedField);
-    }
+    descriptors.push(
+      ...collectSchemaFieldDescriptors({
+        ...input,
+        schemaValue: resolved.items,
+        currentPath: input.currentPath ? `${input.currentPath}[]` : "[]",
+        visitedRefs,
+        ancestorRequired: input.ancestorRequired,
+      }),
+    );
   }
 
   for (const key of ["allOf", "oneOf", "anyOf"] as const) {
@@ -2178,23 +2801,272 @@ function collectSchemaFieldPaths(input: {
     }
 
     for (const schemaEntry of values) {
-      for (const nestedField of collectSchemaFieldPaths({
-        ...input,
-        schemaValue: schemaEntry,
-        visitedRefs,
-      })) {
-        fields.add(nestedField);
-      }
+      descriptors.push(
+        ...collectSchemaFieldDescriptors({
+          ...input,
+          schemaValue: schemaEntry,
+          visitedRefs,
+        }),
+      );
     }
   }
 
-  return [...fields];
+  return dedupeStructuredFields(descriptors);
+}
+
+function dedupeStructuredFields(
+  descriptors: StructuredFieldDescriptor[],
+): StructuredFieldDescriptor[] {
+  const seen = new Set<string>();
+  const deduped: StructuredFieldDescriptor[] = [];
+
+  for (const descriptor of descriptors) {
+    const key = `${descriptor.fieldPath}|${descriptor.required}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(descriptor);
+  }
+
+  return deduped;
+}
+
+function createWorkflowSignalFromParameter(
+  parameter: ParameterSummary,
+  resourceToken?: string,
+): WorkflowSignal | undefined {
+  if (!parameter.name) {
+    return undefined;
+  }
+
+  return {
+    name: parameter.name,
+    normalizedName: normalizeIdentifier(parameter.name),
+    aliases: buildSignalAliases(parameter.name, parameter.name, resourceToken),
+    source:
+      parameter.in === "path"
+        ? "path-parameter"
+        : parameter.in === "query"
+          ? "query-parameter"
+          : parameter.in === "header"
+            ? "query-parameter"
+            : "query-parameter",
+    required: parameter.required,
+    depth: 0,
+  };
+}
+
+function createWorkflowSignalFromField(
+  descriptor: StructuredFieldDescriptor,
+  source: WorkflowSignal["source"],
+  resourceToken: string | undefined,
+  operationKind: OperationKind,
+  isAuthEndpoint = false,
+): WorkflowSignal {
+  return {
+    name: descriptor.fieldPath,
+    normalizedName: descriptor.normalizedName,
+    aliases: buildSignalAliases(
+      descriptor.fieldName,
+      descriptor.fieldPath,
+      source === "response-body" && operationKind === "create"
+        ? resourceToken
+        : undefined,
+      isAuthEndpoint,
+    ),
+    source,
+    required: descriptor.required,
+    depth: descriptor.depth,
+  };
+}
+
+function buildSignalAliases(
+  fieldName: string,
+  fieldPath: string,
+  resourceToken?: string,
+  isAuthEndpoint = false,
+): string[] {
+  const aliases = new Set<string>();
+  const normalizedField = normalizeIdentifier(fieldName);
+  const normalizedPath = normalizeIdentifier(fieldPath.replace(/\[\]/g, " "));
+  const leaf = normalizeIdentifier(
+    fieldPath.replace(/\[\]/g, "").split(".").pop() ?? fieldName,
+  );
+
+  aliases.add(normalizedField);
+  aliases.add(normalizedPath);
+  aliases.add(leaf);
+
+  if (resourceToken && isIdentityName(leaf)) {
+    const suffix = leaf.endsWith("uuid")
+      ? "uuid"
+      : leaf.endsWith("slug")
+        ? "slug"
+        : "id";
+    aliases.add(`${normalizeIdentifier(resourceToken)}${suffix}`);
+  }
+
+  if (isAuthEndpoint && isTokenLikeName(leaf)) {
+    aliases.add("token");
+    aliases.add("accesstoken");
+    aliases.add("bearertoken");
+  }
+
+  return [...aliases].filter(Boolean);
+}
+
+function dedupeWorkflowSignals(signals: WorkflowSignal[]): WorkflowSignal[] {
+  const seen = new Set<string>();
+  const deduped: WorkflowSignal[] = [];
+
+  for (const signal of signals) {
+    const key = `${signal.source}|${signal.name}|${signal.required}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(signal);
+  }
+
+  return deduped;
+}
+
+function inferOperationKind(
+  endpoint: EndpointDetail,
+  isAuthEndpoint: boolean,
+): OperationKind {
+  if (isAuthEndpoint) {
+    return "auth";
+  }
+
+  const tokens = tokenizeSearchText(
+    [
+      endpoint.operationId,
+      endpoint.summary,
+      endpoint.description,
+      endpoint.path,
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+  const hasIdentifierPath = /\{[^}]+\}/.test(endpoint.path);
+
+  switch (endpoint.method) {
+    case "POST":
+      if (
+        tokens.some(
+          (token) =>
+            getSynonymTokens(token).includes("create") || token === "create",
+        )
+      ) {
+        return "create";
+      }
+      return hasIdentifierPath ? "action" : "create";
+    case "GET":
+      return hasIdentifierPath ? "get" : "list";
+    case "PUT":
+    case "PATCH":
+      return "update";
+    case "DELETE":
+      return "delete";
+    default:
+      return "action";
+  }
+}
+
+function isLikelyAuthEndpoint(
+  endpoint: EndpointDetail,
+  responseDescriptors: StructuredFieldDescriptor[],
+): boolean {
+  const tokens = tokenizeSearchText(
+    [
+      endpoint.operationId,
+      endpoint.summary,
+      endpoint.description,
+      endpoint.path,
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+
+  if (
+    tokens.some((token) =>
+      [
+        "auth",
+        "authenticate",
+        "login",
+        "signin",
+        "token",
+        "oauth",
+        "session",
+      ].includes(token),
+    )
+  ) {
+    return true;
+  }
+
+  return responseDescriptors.some((descriptor) =>
+    isTokenLikeName(descriptor.normalizedName),
+  );
+}
+
+function isTokenLikeName(value: string): boolean {
+  return (
+    value === "token" ||
+    value === "accesstoken" ||
+    value === "idtoken" ||
+    value === "refreshtoken" ||
+    value.endsWith("token")
+  );
+}
+
+function isLikelyWorkflowDependencyName(value: string): boolean {
+  return (
+    isIdentityName(value) ||
+    isTokenLikeName(value) ||
+    value.endsWith("file") ||
+    value.endsWith("fileid") ||
+    value.endsWith("imageid") ||
+    value.endsWith("attachmentid") ||
+    value.endsWith("mediaid") ||
+    value.endsWith("documentid") ||
+    value.endsWith("parentid")
+  );
+}
+
+function measureFieldDepth(fieldPath: string): number {
+  return fieldPath.replace(/\[\]/g, "").split(".").filter(Boolean).length;
+}
+
+function toFieldDepthMap(
+  descriptors: StructuredFieldDescriptor[],
+): Record<string, number> {
+  const depthMap: Record<string, number> = {};
+
+  for (const descriptor of descriptors) {
+    for (const token of [descriptor.fieldName, descriptor.fieldPath]) {
+      const normalized = normalizeIdentifier(token.replace(/\[\]/g, " "));
+      if (!normalized) {
+        continue;
+      }
+
+      const current = depthMap[normalized];
+      depthMap[normalized] =
+        current === undefined
+          ? descriptor.depth
+          : Math.min(current, descriptor.depth);
+    }
+  }
+
+  return depthMap;
 }
 
 function scoreSearchDocument(
   document: EndpointSearchDocument,
-  queryTokens: string[],
+  searchTerms: Array<{ token: string; display: string; weight: number }>,
   normalizedPhrase: string,
+  desiredOperationKinds: Set<OperationKind>,
 ):
   | {
       endpoint: EndpointSummary;
@@ -2203,34 +3075,68 @@ function scoreSearchDocument(
     }
   | undefined {
   const primary = new Set(document.primaryTokens);
+  const pathTokens = new Set(document.pathTokens);
+  const operationTokens = new Set(document.operationTokens);
+  const tagTokens = new Set(document.tagTokens);
   const parameters = new Set(document.parameterTokens);
   const request = new Set(document.requestTokens);
   const responses = new Set(document.responseTokens);
   const matchedTerms = new Set<string>();
   let score = 0;
 
-  for (const token of queryTokens) {
+  for (const term of searchTerms) {
+    const { token, display, weight } = term;
+
+    if (pathTokens.has(token)) {
+      score += 2.75 * weight;
+      matchedTerms.add(display);
+      continue;
+    }
+
+    if (operationTokens.has(token)) {
+      score += 2.25 * weight;
+      matchedTerms.add(display);
+      continue;
+    }
+
+    if (tagTokens.has(token)) {
+      score += 1.75 * weight;
+      matchedTerms.add(display);
+      continue;
+    }
+
     if (primary.has(token)) {
-      score += token === document.endpoint.method.toLowerCase() ? 2.5 : 2;
-      matchedTerms.add(token);
+      score +=
+        token === document.endpoint.method.toLowerCase()
+          ? 2.5 * weight
+          : 1.6 * weight;
+      matchedTerms.add(display);
       continue;
     }
 
     if (parameters.has(token)) {
-      score += 1.5;
-      matchedTerms.add(token);
+      score += 1.5 * weight;
+      matchedTerms.add(display);
       continue;
     }
 
-    if (request.has(token) || responses.has(token)) {
-      score += 1;
-      matchedTerms.add(token);
+    if (request.has(token)) {
+      const depth = document.requestFieldDepths[token] ?? 1;
+      score += Math.max(0.75, 1.4 - (depth - 1) * 0.15) * weight;
+      matchedTerms.add(display);
+      continue;
+    }
+
+    if (responses.has(token)) {
+      const depth = document.responseFieldDepths[token] ?? 1;
+      score += Math.max(0.6, 1.15 - (depth - 1) * 0.12) * weight;
+      matchedTerms.add(display);
       continue;
     }
 
     if (document.searchText.includes(token)) {
-      score += 0.5;
-      matchedTerms.add(token);
+      score += 0.35 * weight;
+      matchedTerms.add(display);
     }
   }
 
@@ -2238,7 +3144,10 @@ function scoreSearchDocument(
     return undefined;
   }
 
-  let normalizedScore = score / Math.max(queryTokens.length, 1);
+  let normalizedScore = score / Math.max(searchTerms.length, 1);
+  if (desiredOperationKinds.has(document.operationKind)) {
+    normalizedScore += 0.85;
+  }
   if (normalizedPhrase && document.searchText.includes(normalizedPhrase)) {
     normalizedScore += 0.5;
   }
@@ -2248,6 +3157,416 @@ function scoreSearchDocument(
     score: Number(normalizedScore.toFixed(3)),
     matchedTerms: [...matchedTerms],
   };
+}
+
+function buildWorkflowSuggestion(
+  resolved: ResolvedDocument,
+  target: EndpointSummary,
+  maxDepth: number,
+): WorkflowSuggestion | undefined {
+  const workflowMap = new Map(
+    resolved.workflowDocuments.map((workflow) => [workflow.key, workflow]),
+  );
+  const targetKey = `${target.method} ${target.path}`;
+  const targetWorkflow = workflowMap.get(targetKey);
+  if (!targetWorkflow) {
+    return undefined;
+  }
+
+  const orderedSteps: WorkflowDocument[] = [];
+  const added = new Set<string>();
+  const visiting = new Set<string>();
+  const availableOutputs = new Set<string>();
+  const stepReasons = new Map<string, string[]>();
+  const coveredDependencies = new Set<string>();
+  const missingDependencies = new Set<string>();
+
+  const addStepReason = (key: string, reason: string) => {
+    const reasons = stepReasons.get(key) ?? [];
+    if (!reasons.includes(reason)) {
+      reasons.push(reason);
+    }
+    stepReasons.set(key, reasons);
+  };
+
+  const hasAvailableDependency = (signal: WorkflowSignal): boolean =>
+    signal.aliases.some((alias) => availableOutputs.has(alias));
+
+  const registerOutputs = (workflow: WorkflowDocument) => {
+    for (const output of workflow.producedOutputs) {
+      for (const alias of output.aliases) {
+        availableOutputs.add(alias);
+      }
+    }
+  };
+
+  const ensureWorkflow = (workflow: WorkflowDocument, depth: number) => {
+    if (
+      added.has(workflow.key) ||
+      visiting.has(workflow.key) ||
+      depth > maxDepth
+    ) {
+      return;
+    }
+
+    visiting.add(workflow.key);
+    const dependencies = workflow.requiredInputs;
+
+    for (const dependency of dependencies) {
+      if (hasAvailableDependency(dependency)) {
+        coveredDependencies.add(dependency.name);
+        continue;
+      }
+
+      const candidate = findBestProducer(
+        resolved.workflowDocuments,
+        workflow,
+        dependency,
+        added,
+        visiting,
+      );
+
+      if (!candidate) {
+        missingDependencies.add(dependency.name);
+        continue;
+      }
+
+      addStepReason(
+        candidate.key,
+        explainProducerMatch(candidate, dependency, workflow),
+      );
+      ensureWorkflow(candidate, depth + 1);
+
+      if (
+        hasAvailableDependency(dependency) ||
+        producesDependency(candidate, dependency)
+      ) {
+        coveredDependencies.add(dependency.name);
+      } else {
+        missingDependencies.add(dependency.name);
+      }
+    }
+
+    visiting.delete(workflow.key);
+
+    if (!added.has(workflow.key)) {
+      if (workflow.key === targetWorkflow.key) {
+        addStepReason(workflow.key, "target endpoint");
+      }
+      orderedSteps.push(workflow);
+      added.add(workflow.key);
+      registerOutputs(workflow);
+    }
+  };
+
+  ensureWorkflow(targetWorkflow, 0);
+
+  const uniqueCovered = [...coveredDependencies].sort();
+  const uniqueMissing = [...missingDependencies]
+    .filter((dependency) => !coveredDependencies.has(dependency))
+    .sort();
+  const sortedSteps = topologicallyOrderWorkflows(orderedSteps);
+  const steps = sortedSteps.map((workflow, index) => ({
+    step: index + 1,
+    method: workflow.endpoint.method,
+    path: workflow.endpoint.path,
+    operationId: workflow.endpoint.operationId,
+    summary: workflow.endpoint.summary,
+    operationKind: workflow.operationKind,
+    reasons: stepReasons.get(workflow.key) ?? [],
+    produces: workflow.producedOutputs.map((output) => output.name),
+    consumes: workflow.requiredInputs.map((input) => input.name),
+  }));
+
+  const dependencyCount = uniqueCovered.length + uniqueMissing.length;
+  const dependencyCoverage =
+    dependencyCount === 0
+      ? 1
+      : uniqueCovered.length / Math.max(dependencyCount, 1);
+  const stepPenalty = Math.max(0, (steps.length - 1) * 0.05);
+  const confidence = Math.max(
+    0.1,
+    Number((dependencyCoverage - stepPenalty).toFixed(3)),
+  );
+
+  return {
+    target,
+    confidence,
+    coveredDependencies: uniqueCovered,
+    missingDependencies: uniqueMissing,
+    steps,
+  };
+}
+
+function findBestProducer(
+  workflows: WorkflowDocument[],
+  consumer: WorkflowDocument,
+  dependency: WorkflowSignal,
+  added: Set<string>,
+  visiting: Set<string>,
+): WorkflowDocument | undefined {
+  let best:
+    | {
+        workflow: WorkflowDocument;
+        score: number;
+      }
+    | undefined;
+
+  for (const workflow of workflows) {
+    if (workflow.key === consumer.key || visiting.has(workflow.key)) {
+      continue;
+    }
+
+    const score = scoreProducerCandidate(workflow, consumer, dependency, added);
+    if (score <= 0) {
+      continue;
+    }
+
+    if (!best || score > best.score) {
+      best = {
+        workflow,
+        score,
+      };
+    }
+  }
+
+  return best?.workflow;
+}
+
+function topologicallyOrderWorkflows(
+  workflows: WorkflowDocument[],
+): WorkflowDocument[] {
+  const workflowMap = new Map(
+    workflows.map((workflow) => [workflow.key, workflow]),
+  );
+  const orderMap = new Map(
+    workflows.map((workflow, index) => [workflow.key, index]),
+  );
+  const edges = new Map<string, Set<string>>();
+  const indegree = new Map<string, number>();
+
+  for (const workflow of workflows) {
+    edges.set(workflow.key, new Set<string>());
+    indegree.set(workflow.key, 0);
+  }
+
+  for (const producer of workflows) {
+    for (const consumer of workflows) {
+      if (producer.key === consumer.key) {
+        continue;
+      }
+
+      if (
+        !consumer.requiredInputs.some((dependency) =>
+          producesDependency(producer, dependency),
+        )
+      ) {
+        continue;
+      }
+
+      const next = edges.get(producer.key);
+      if (!next || next.has(consumer.key)) {
+        continue;
+      }
+
+      next.add(consumer.key);
+      indegree.set(consumer.key, (indegree.get(consumer.key) ?? 0) + 1);
+    }
+  }
+
+  const queue = workflows
+    .filter((workflow) => (indegree.get(workflow.key) ?? 0) === 0)
+    .sort(
+      (left, right) =>
+        (orderMap.get(left.key) ?? 0) - (orderMap.get(right.key) ?? 0),
+    );
+  const sorted: WorkflowDocument[] = [];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) {
+      continue;
+    }
+
+    sorted.push(current);
+    const nextKeys = [...(edges.get(current.key) ?? [])].sort(
+      (left, right) => (orderMap.get(left) ?? 0) - (orderMap.get(right) ?? 0),
+    );
+
+    for (const nextKey of nextKeys) {
+      const nextDegree = (indegree.get(nextKey) ?? 0) - 1;
+      indegree.set(nextKey, nextDegree);
+      if (nextDegree === 0) {
+        const nextWorkflow = workflowMap.get(nextKey);
+        if (nextWorkflow) {
+          queue.push(nextWorkflow);
+        }
+      }
+    }
+
+    queue.sort(
+      (left, right) =>
+        (orderMap.get(left.key) ?? 0) - (orderMap.get(right.key) ?? 0),
+    );
+  }
+
+  return sorted.length === workflows.length ? sorted : workflows;
+}
+
+function scoreProducerCandidate(
+  producer: WorkflowDocument,
+  consumer: WorkflowDocument,
+  dependency: WorkflowSignal,
+  added: Set<string>,
+): number {
+  let score = 0;
+  const dependencyAliases = new Set(dependency.aliases);
+  const producerAliases = new Set(
+    producer.producedOutputs.flatMap((output) => output.aliases),
+  );
+  const sharedAliases = [...dependencyAliases].filter((alias) =>
+    producerAliases.has(alias),
+  );
+
+  if (sharedAliases.length > 0) {
+    score += sharedAliases.length * 7;
+  }
+
+  if (
+    dependency.aliases.includes("accesstoken") &&
+    (producer.isAuthEndpoint || producer.operationKind === "auth")
+  ) {
+    score += 10;
+  }
+
+  const consumerResources = new Set(consumer.resourceTokens);
+  const producerResources = producer.resourceTokens.filter((token) =>
+    consumerResources.has(token),
+  );
+  if (producerResources.length > 0) {
+    score += producerResources.length * 2.5;
+  }
+
+  if (isPathRelated(producer.endpoint.path, consumer.endpoint.path)) {
+    score += 1.5;
+  }
+
+  if (producer.operationKind === "create") {
+    score += 2;
+  } else if (
+    producer.operationKind === "get" ||
+    producer.operationKind === "list"
+  ) {
+    score -= 1;
+  }
+
+  if (added.has(producer.key)) {
+    score += 0.5;
+  }
+
+  return score;
+}
+
+function producesDependency(
+  workflow: WorkflowDocument,
+  dependency: WorkflowSignal,
+): boolean {
+  return workflow.producedOutputs.some((output) =>
+    output.aliases.some((alias) => dependency.aliases.includes(alias)),
+  );
+}
+
+function explainProducerMatch(
+  producer: WorkflowDocument,
+  dependency: WorkflowSignal,
+  consumer: WorkflowDocument,
+): string {
+  if (
+    dependency.aliases.includes("accesstoken") &&
+    (producer.isAuthEndpoint || producer.operationKind === "auth")
+  ) {
+    return `provides authentication token required before ${consumer.endpoint.method} ${consumer.endpoint.path}`;
+  }
+
+  const matchingOutput = producer.producedOutputs.find((output) =>
+    output.aliases.some((alias) => dependency.aliases.includes(alias)),
+  );
+  if (matchingOutput) {
+    return `produces ${matchingOutput.name} needed by ${consumer.endpoint.method} ${consumer.endpoint.path}`;
+  }
+
+  return `supports upstream dependency for ${consumer.endpoint.method} ${consumer.endpoint.path}`;
+}
+
+function buildSearchTerms(
+  query: string,
+): Array<{ token: string; display: string; weight: number }> {
+  const baseTokens = tokenizeSearchText(query);
+  const terms = new Map<
+    string,
+    { token: string; display: string; weight: number }
+  >();
+
+  for (const token of baseTokens) {
+    terms.set(token, {
+      token,
+      display: token,
+      weight: 1,
+    });
+
+    for (const synonym of getSynonymTokens(token)) {
+      const existing = terms.get(synonym);
+      if (!existing || existing.weight < 0.65) {
+        terms.set(synonym, {
+          token: synonym,
+          display: token,
+          weight: 0.65,
+        });
+      }
+    }
+  }
+
+  return [...terms.values()];
+}
+
+function inferDesiredOperationKinds(
+  searchTerms: Array<{ token: string; display: string; weight: number }>,
+): Set<OperationKind> {
+  const kinds = new Set<OperationKind>();
+
+  for (const term of searchTerms) {
+    const token = term.token;
+    if (getSynonymTokens(token).includes("create") || token === "create") {
+      kinds.add("create");
+    }
+    if (getSynonymTokens(token).includes("update") || token === "update") {
+      kinds.add("update");
+    }
+    if (getSynonymTokens(token).includes("delete") || token === "delete") {
+      kinds.add("delete");
+    }
+    if (getSynonymTokens(token).includes("list") || token === "list") {
+      kinds.add("list");
+    }
+    if (getSynonymTokens(token).includes("get") || token === "get") {
+      kinds.add("get");
+    }
+    if (getSynonymTokens(token).includes("auth") || token === "auth") {
+      kinds.add("auth");
+    }
+  }
+
+  return kinds;
+}
+
+function getSynonymTokens(token: string): string[] {
+  for (const group of SEARCH_SYNONYM_GROUPS) {
+    if ((group as readonly string[]).includes(token)) {
+      return [...group];
+    }
+  }
+
+  return [token];
 }
 
 function tokenizeSearchText(value: string): string[] {

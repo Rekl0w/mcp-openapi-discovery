@@ -29,12 +29,14 @@ It is especially useful for:
 
 - Detect OpenAPI / Swagger specs from docs pages or direct spec URLs
 - Assign a stable in-memory `specId` for each detected spec so later tools can work without re-exposing the full document
+- Persist discovered specs on disk so `specId`-based tools can survive process restarts
 - Summarize API metadata, servers, tags, and endpoint counts
 - List endpoints with filtering by method, tag, or path fragment
-- Search endpoints server-side with weighted matching across methods, paths, tags, summaries, parameters, and schema field names
+- Search endpoints server-side with weighted matching across methods, paths, tags, summaries, parameters, schema field names, synonyms, and operation intent
 - Inspect request / response details for a specific endpoint
 - Trace where identifiers like `userId`, `accountId`, or `teamId` appear across parameters and schemas
 - Find endpoints that are structurally related to another endpoint
+- Suggest likely multi-step API workflows such as login → create category → create attribute → create product
 - Bundle external `$ref` files and remote schema references into a local in-memory document before analysis
 - Execute endpoints with:
   - path params
@@ -56,6 +58,7 @@ It is especially useful for:
 - `detect_openapi`: detects the OpenAPI document behind a docs page or spec URL and returns a summary
 - `list_endpoints`: lists endpoints with optional filtering
 - `search_endpoints`: searches cached endpoints for a detected spec using server-side weighted scoring
+- `suggest_call_sequence`: suggests a likely prerequisite call chain for a target endpoint or a natural-language goal
 - `get_endpoint_details`: returns request / response details for a single endpoint
 - `trace_parameter_usage`: traces where a parameter or field is used across parameters, request bodies, and response bodies
 - `find_related_endpoints`: finds endpoints related to a source endpoint through shared resources, identifiers, and path structure
@@ -167,9 +170,11 @@ Add this to `%APPDATA%\Claude\claude_desktop_config.json`:
 
 - Detect the spec behind `https://example.com/docs`
 - Detect a spec, keep the returned `specId`, and search only the most relevant endpoints
+- Detect a spec, keep the returned `specId`, and reuse it across restarts via persistent cache
 - List endpoints from `https://api.example.com/openapi.json`
 - Inspect the `PUT /users/{id}` endpoint
 - Filter only `POST` endpoints tagged with `users`
+- Ask the server for a likely workflow such as “create product with category and attributes”
 - Trace where `userId` appears across the API
 - Find endpoints related to `GET /users/{id}`
 - Send a real `POST /orders` request with a JSON payload
@@ -211,6 +216,39 @@ The server builds a searchable text index per endpoint from:
 - response body field names
 
 This keeps endpoint retrieval on the server side and returns only the top matches.
+
+The search scorer also adds intent-aware bonuses so queries like `add order`, `login token`, or `edit product` can still match `createOrder`, auth endpoints, and `PATCH`/`PUT` style operations without embeddings.
+
+### `suggest_call_sequence` flow
+
+Use `suggest_call_sequence` when the hard part is not finding the endpoint, but figuring out the order of dependent calls.
+
+It can work in two modes:
+
+- by exact target endpoint: `targetMethod` + `targetPath`
+- by natural-language goal: `goal`
+
+The server analyzes:
+
+- auth requirements
+- path parameter dependencies
+- request body identifier fields such as `categoryId`, `attributeId`, `fileId`, or `parentId`
+- response body outputs such as `id`, `accessToken`, or resource-specific identifiers
+- parent/child path relationships
+
+This makes it possible to suggest chains like:
+
+- login → create category → create category attribute → create product
+- login → create customer → create order
+- upload file → create entity using returned file id
+
+### Persistent cache
+
+Detected specs are cached to disk and keyed by both normalized input URL and `specId`.
+
+That means `search_endpoints` and `suggest_call_sequence` can keep working even after the process restarts, as long as the cached spec is still within the cache TTL.
+
+If needed, you can override the cache directory with the `MCP_OPENAPI_DISCOVERY_CACHE_DIR` environment variable.
 
 ### Example tracing queries
 
@@ -326,6 +364,8 @@ This runs:
 - Runtime: Node.js 18+
 - MCP SDK: `@modelcontextprotocol/sdk` v1
 - Spec parsing: JSON / YAML + HTML discovery heuristics + bundled external `$ref` support
+- Cache: in-memory + disk-backed spec cache keyed by URL and `specId`
+- Workflow planning: dependency inference across auth, path params, request body ids, and response outputs
 - Request execution: real HTTP requests with automatic auth handling
 - Test runner: `vitest`
 
