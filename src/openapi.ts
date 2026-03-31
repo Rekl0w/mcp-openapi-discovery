@@ -31,6 +31,9 @@ const COMMON_SPEC_PATHS = [
   "swagger.json",
   "swagger.yaml",
   "swagger.yml",
+  "swagger/v1/swagger.json",
+  "swagger/v2/swagger.json",
+  "swagger/v3/swagger.json",
   "api-docs",
   "api-docs.json",
   "api/openapi.json",
@@ -42,7 +45,43 @@ const COMMON_SPEC_PATHS = [
   "docs/swagger.yaml",
   "openapi",
   "swagger",
+  "scalar",
+  "request-docs",
+  "request-docs/api?openapi=true",
+  "request-docs/api?openapi=1",
+  "api?openapi=true",
+  "api?openapi=1",
 ] as const;
+
+const HIGH_SIGNAL_SPEC_PATHS = [
+  "api?openapi=true",
+  "api?openapi=1",
+  "api/v3/openapi.json",
+  "api/v2/openapi.json",
+  "api/v1/openapi.json",
+  "swagger/v1/swagger.json",
+  "request-docs/api?openapi=true",
+  "v3/openapi.json",
+  "v2/openapi.json",
+  "v1/openapi.json",
+  "openapi.json",
+  "swagger.json",
+] as const;
+
+const GENERIC_NON_RESOURCE_SEGMENTS = new Set([
+  "api",
+  "store",
+  "create",
+  "update",
+  "edit",
+  "delete",
+  "destroy",
+  "remove",
+  "getall",
+  "getbyid",
+  "list",
+  "show",
+]);
 
 const ACCEPT_HEADER = [
   "application/openapi+json",
@@ -53,13 +92,13 @@ const ACCEPT_HEADER = [
   "text/html;q=0.9",
 ].join(", ");
 
-const USER_AGENT = "mcp-openapi-discovery/0.3.0";
+const USER_AGENT = "mcp-openapi-discovery/0.3.1";
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_CANDIDATES = 30;
 const MAX_SCHEMA_PROPERTIES = 12;
 const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
-const CACHE_SCHEMA_VERSION = 1;
+const CACHE_SCHEMA_VERSION = 2;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const CACHE_DIR_NAME = ".mcp-openapi-discovery-cache";
 const DEFAULT_WORKFLOW_LIMIT = 3;
@@ -1888,13 +1927,15 @@ async function discoverOpenApiDocument(
         return resolved;
       }
 
-      for (const nextCandidate of extractCandidateUrlsFromHtml(
+      const discoveredCandidates = extractCandidateUrlsFromHtml(
         fetched.body,
         fetched.finalUrl,
         candidate.trail,
-      )) {
+      );
+
+      for (const nextCandidate of discoveredCandidates.reverse()) {
         if (!visited.has(nextCandidate.url)) {
-          queue.push(nextCandidate);
+          queue.unshift(nextCandidate);
         }
       }
     }
@@ -2062,6 +2103,19 @@ function buildInitialCandidates(inputUrl: URL): CandidateUrl[] {
 
   const root = new URL("/", inputUrl);
   const currentDir = new URL("./", inputUrl);
+  const pageDir = getPageDirectoryUrl(inputUrl);
+
+  for (const path of HIGH_SIGNAL_SPEC_PATHS) {
+    add(new URL(path, pageDir).toString(), "common-path", [
+      `high-signal page-directory path: ${path}`,
+    ]);
+    add(new URL(path, root).toString(), "common-path", [
+      `high-signal origin path: ${path}`,
+    ]);
+    add(new URL(path, currentDir).toString(), "common-path", [
+      `high-signal current-directory path: ${path}`,
+    ]);
+  }
 
   for (const path of COMMON_SPEC_PATHS) {
     add(new URL(path, root).toString(), "common-path", [
@@ -2070,9 +2124,21 @@ function buildInitialCandidates(inputUrl: URL): CandidateUrl[] {
     add(new URL(path, currentDir).toString(), "common-path", [
       `common path from current directory: ${path}`,
     ]);
+    add(new URL(path, pageDir).toString(), "common-path", [
+      `common path from page directory: ${path}`,
+    ]);
   }
 
   return candidates;
+}
+
+function getPageDirectoryUrl(inputUrl: URL): URL {
+  const pageDir = new URL(inputUrl.toString());
+  pageDir.search = "";
+  if (!pageDir.pathname.endsWith("/")) {
+    pageDir.pathname = `${pageDir.pathname}/`;
+  }
+  return pageDir;
 }
 
 function extractCandidateUrlsFromHtml(
@@ -2119,12 +2185,27 @@ function extractCandidateUrlsFromHtml(
     /Redoc\.init\(\s*["'`]([^"'`]+)["'`]/gi,
     /\b(?:specUrl|spec-url|apiDefinitionUrl|definitionUrl)\b\s*[:=]\s*["'`]([^"'`]+)["'`]/gi,
     /\burl\s*:\s*["'`]([^"'`]+(?:openapi|swagger|api-docs)[^"'`]*)["'`]/gi,
+    /\\?["'](?:url|specUrl|configUrl)\\?["']\s*:\s*\\?["'`]([^"'`]+)["'`]/gi,
+    /\bsources\b[\s\S]*?\\?["']url\\?["']\s*:\s*\\?["'`]([^"'`]+)["'`]/gi,
+    /Download OpenAPI Document[^\n\r]*\(([^)]+(?:openapi|swagger|api-docs)[^)]+)\)/gi,
   ];
 
   for (const pattern of scriptPatterns) {
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(html)) !== null) {
       add(match[1], "script config");
+    }
+  }
+
+  const rawSpecPathPatterns = [
+    /(?:\/|\.\/|\.\.\/)?(?:swagger|openapi|api-docs)[^"'`\s)]*\.(?:json|ya?ml)(?:\?[^"'`\s)]*)?/gi,
+    /(?:\/|\.\/|\.\.\/)?[^"'`\s)]*\?openapi=(?:true|1)[^"'`\s)]*/gi,
+  ];
+
+  for (const pattern of rawSpecPathPatterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(html)) !== null) {
+      add(match[0], "raw spec path");
     }
   }
 
@@ -2545,7 +2626,8 @@ function buildWorkflowDocuments(
       const operationKind = isAuthEndpoint
         ? "auth"
         : inferOperationKind(context.endpoint, isAuthEndpoint);
-      const resourceToken = resourceTokens.at(-1);
+      const resourceToken = inferPrimaryResourceToken(path);
+      const isPublicEndpoint = isLikelyPublicEndpoint(context.endpoint);
 
       const requiredInputs: WorkflowSignal[] = [];
       const optionalInputs: WorkflowSignal[] = [];
@@ -2593,6 +2675,8 @@ function buildWorkflowDocuments(
       }
 
       if (
+        !isPublicEndpoint &&
+        !isAuthEndpoint &&
         context.securityRequirements.some(
           (requirement) => requirement.length > 0,
         )
@@ -2607,15 +2691,23 @@ function buildWorkflowDocuments(
         });
       }
 
-      const producedOutputs = responseDescriptors.map((descriptor) =>
-        createWorkflowSignalFromField(
-          descriptor,
-          "response-body",
-          resourceToken,
-          operationKind,
-          isAuthEndpoint,
+      const producedOutputs = [
+        ...responseDescriptors.map((descriptor) =>
+          createWorkflowSignalFromField(
+            descriptor,
+            "response-body",
+            resourceToken,
+            operationKind,
+            isAuthEndpoint,
+          ),
         ),
-      );
+        ...inferImplicitWorkflowOutputs({
+          endpoint: context.endpoint,
+          operationKind,
+          resourceToken,
+          isAuthEndpoint,
+        }),
+      ];
 
       documents.push({
         key: `${context.endpoint.method} ${context.endpoint.path}`,
@@ -2761,7 +2853,10 @@ function collectSchemaFieldDescriptors(input: {
       const fieldPath = input.currentPath
         ? `${input.currentPath}.${propertyName}`
         : propertyName;
-      const required = input.ancestorRequired && requiredSet.has(propertyName);
+      const required =
+        input.ancestorRequired &&
+        (requiredSet.has(propertyName) ||
+          isSchemaMarkedRequired(propertySchema));
       descriptors.push({
         fieldName: propertyName,
         fieldPath,
@@ -2812,6 +2907,10 @@ function collectSchemaFieldDescriptors(input: {
   }
 
   return dedupeStructuredFields(descriptors);
+}
+
+function isSchemaMarkedRequired(schemaValue: unknown): boolean {
+  return isObject(schemaValue) && schemaValue.nullable === false;
 }
 
 function dedupeStructuredFields(
@@ -2879,6 +2978,55 @@ function createWorkflowSignalFromField(
     required: descriptor.required,
     depth: descriptor.depth,
   };
+}
+
+function inferImplicitWorkflowOutputs(input: {
+  endpoint: EndpointDetail;
+  operationKind: OperationKind;
+  resourceToken?: string;
+  isAuthEndpoint: boolean;
+}): WorkflowSignal[] {
+  const outputs: WorkflowSignal[] = [];
+
+  if (input.isAuthEndpoint) {
+    outputs.push({
+      name: "accessToken",
+      normalizedName: "accesstoken",
+      aliases: ["accesstoken", "token", "bearertoken"],
+      source: "response-body",
+      required: false,
+      depth: 0,
+    });
+  }
+
+  if (input.operationKind === "create") {
+    outputs.push({
+      name: "id",
+      normalizedName: "id",
+      aliases: buildSignalAliases("id", "id", input.resourceToken),
+      source: "response-body",
+      required: false,
+      depth: 0,
+    });
+
+    if (input.resourceToken) {
+      const resourceId = `${input.resourceToken}Id`;
+      outputs.push({
+        name: resourceId,
+        normalizedName: normalizeIdentifier(resourceId),
+        aliases: buildSignalAliases(
+          resourceId,
+          resourceId,
+          input.resourceToken,
+        ),
+        source: "response-body",
+        required: false,
+        depth: 0,
+      });
+    }
+  }
+
+  return outputs;
 }
 
 function buildSignalAliases(
@@ -3008,6 +3156,20 @@ function isLikelyAuthEndpoint(
 
   return responseDescriptors.some((descriptor) =>
     isTokenLikeName(descriptor.normalizedName),
+  );
+}
+
+function isLikelyPublicEndpoint(endpoint: EndpointDetail): boolean {
+  const text = [endpoint.summary, endpoint.description]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  return (
+    /gerekli\s+permission\s*:\s*yok/iu.test(text) ||
+    /herkese\s+açık(?:tır)?/iu.test(text) ||
+    /public\s+endpoint/i.test(text) ||
+    /authentication\s+not\s+required/i.test(text) ||
+    /no\s+auth/i.test(text)
   );
 }
 
@@ -3419,7 +3581,19 @@ function scoreProducerCandidate(
   dependency: WorkflowSignal,
   added: Set<string>,
 ): number {
-  let score = 0;
+  if (
+    producer.endpoint.method === "HEAD" ||
+    producer.endpoint.method === "OPTIONS" ||
+    producer.endpoint.method === "TRACE" ||
+    producer.operationKind === "delete"
+  ) {
+    return 0;
+  }
+
+  if (!producer.isAuthEndpoint && producer.producedOutputs.length === 0) {
+    return 0;
+  }
+
   const dependencyAliases = new Set(dependency.aliases);
   const producerAliases = new Set(
     producer.producedOutputs.flatMap((output) => output.aliases),
@@ -3427,15 +3601,21 @@ function scoreProducerCandidate(
   const sharedAliases = [...dependencyAliases].filter((alias) =>
     producerAliases.has(alias),
   );
+  const satisfiesAuthDependency =
+    dependency.aliases.includes("accesstoken") &&
+    (producer.isAuthEndpoint || producer.operationKind === "auth");
+
+  if (sharedAliases.length === 0 && !satisfiesAuthDependency) {
+    return 0;
+  }
+
+  let score = 0;
 
   if (sharedAliases.length > 0) {
     score += sharedAliases.length * 7;
   }
 
-  if (
-    dependency.aliases.includes("accesstoken") &&
-    (producer.isAuthEndpoint || producer.operationKind === "auth")
-  ) {
+  if (satisfiesAuthDependency) {
     score += 10;
   }
 
@@ -3457,7 +3637,7 @@ function scoreProducerCandidate(
     producer.operationKind === "get" ||
     producer.operationKind === "list"
   ) {
-    score -= 1;
+    score -= 2;
   }
 
   if (added.has(producer.key)) {
@@ -4110,6 +4290,10 @@ function getEffectiveSecurity(
   operation: JsonObject,
   doc: OpenApiDocument,
 ): unknown[] {
+  if (isLikelyPublicOperation(operation)) {
+    return [];
+  }
+
   if (Array.isArray(operation.security)) {
     return operation.security;
   }
@@ -4119,6 +4303,20 @@ function getEffectiveSecurity(
   }
 
   return [];
+}
+
+function isLikelyPublicOperation(operation: JsonObject): boolean {
+  const text = [operation.summary, operation.description]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  return (
+    /gerekli\s+permission\s*:\s*yok/iu.test(text) ||
+    /herkese\s+açık(?:tır)?/iu.test(text) ||
+    /public\s+endpoint/i.test(text) ||
+    /authentication\s+not\s+required/i.test(text) ||
+    /no\s+auth/i.test(text)
+  );
 }
 
 function collectServerUrls(
@@ -4309,12 +4507,41 @@ function isLikelySpecPath(value: string | undefined): boolean {
   const normalized = value.toLowerCase();
   return (
     normalized.includes("openapi") ||
+    normalized.includes("openapi=true") ||
+    normalized.includes("openapi=1") ||
     normalized.includes("swagger") ||
     normalized.includes("api-docs") ||
     normalized.endsWith(".json") ||
     normalized.endsWith(".yaml") ||
     normalized.endsWith(".yml")
   );
+}
+
+function inferPrimaryResourceToken(path: string): string | undefined {
+  const segments = path
+    .split("/")
+    .filter(Boolean)
+    .filter((segment) => !segment.startsWith("{") && !segment.endsWith("}"))
+    .map((segment) => normalizeIdentifier(segment));
+
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (!segment || GENERIC_NON_RESOURCE_SEGMENTS.has(segment)) {
+      continue;
+    }
+
+    if (
+      segment.startsWith("sync") ||
+      segment.startsWith("getby") ||
+      segment.startsWith("getall")
+    ) {
+      continue;
+    }
+
+    return singularizeToken(segment);
+  }
+
+  return undefined;
 }
 
 function isObject(value: unknown): value is JsonObject {

@@ -127,7 +127,8 @@ export async function callOpenApiEndpoint(
   const pathParams = input.pathParams ?? {};
   const queryInput = input.query ?? {};
   const resolvedPath = resolvePathTemplate(input.path, pathParams);
-  const requestUrl = buildRequestUrl(context.baseUrl, resolvedPath, queryInput);
+  const requestBaseUrl = resolveRequestBaseUrl(context);
+  const requestUrl = buildRequestUrl(requestBaseUrl, resolvedPath, queryInput);
   const headers = normalizeHeaders(input.headers);
   const state: MutableRequestState = {
     headers,
@@ -896,11 +897,101 @@ function buildRequestUrl(
 ): URL {
   const url = new URL(baseUrl);
   const basePath = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
-  url.pathname = `${basePath}${resolvedPath.startsWith("/") ? resolvedPath : `/${resolvedPath}`}`;
+  const normalizedResolvedPath = resolvedPath.startsWith("/")
+    ? resolvedPath
+    : `/${resolvedPath}`;
+  const finalPath =
+    basePath && normalizedResolvedPath === basePath
+      ? basePath
+      : basePath && normalizedResolvedPath.startsWith(`${basePath}/`)
+        ? normalizedResolvedPath
+        : `${basePath}${normalizedResolvedPath}`;
+  url.pathname = finalPath || "/";
   url.search = "";
   url.hash = "";
   appendQueryValues(url.searchParams, query);
   return url;
+}
+
+function resolveRequestBaseUrl(context: EndpointExecutionContext): string {
+  const preferredFallbackSource =
+    context.discovery.pageUrl ??
+    context.discovery.documentUrl ??
+    context.discovery.inputUrl;
+
+  if (!preferredFallbackSource) {
+    return context.baseUrl;
+  }
+
+  let configuredBaseUrl: URL;
+  let fallbackSourceUrl: URL;
+
+  try {
+    configuredBaseUrl = new URL(context.baseUrl);
+    fallbackSourceUrl = new URL(preferredFallbackSource);
+  } catch {
+    return context.baseUrl;
+  }
+
+  if (!shouldRewriteBaseUrl(configuredBaseUrl, fallbackSourceUrl)) {
+    return context.baseUrl;
+  }
+
+  const rewritten = new URL(fallbackSourceUrl.origin);
+  rewritten.pathname = configuredBaseUrl.pathname || "/";
+  rewritten.search = configuredBaseUrl.search;
+  rewritten.hash = "";
+  return rewritten.toString();
+}
+
+function shouldRewriteBaseUrl(baseUrl: URL, fallbackSourceUrl: URL): boolean {
+  if (!isProbablyLocalOrPrivateHost(baseUrl.hostname)) {
+    return false;
+  }
+
+  if (isProbablyLocalOrPrivateHost(fallbackSourceUrl.hostname)) {
+    return false;
+  }
+
+  return (
+    normalizeHostname(baseUrl.hostname) !==
+    normalizeHostname(fallbackSourceUrl.hostname)
+  );
+}
+
+function isProbablyLocalOrPrivateHost(hostname: string): boolean {
+  const normalized = normalizeHostname(hostname);
+
+  if (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "0.0.0.0" ||
+    normalized === "::1"
+  ) {
+    return true;
+  }
+
+  if (/^10\./.test(normalized)) {
+    return true;
+  }
+
+  if (/^192\.168\./.test(normalized)) {
+    return true;
+  }
+
+  const match172 = normalized.match(/^172\.(\d{1,3})\./);
+  if (match172) {
+    const secondOctet = Number(match172[1]);
+    if (secondOctet >= 16 && secondOctet <= 31) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function normalizeHostname(hostname: string): string {
+  return hostname.replace(/^\[|\]$/g, "").toLowerCase();
 }
 
 function appendQueryValues(

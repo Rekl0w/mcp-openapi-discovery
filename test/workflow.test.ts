@@ -405,4 +405,416 @@ describe("workflow planning and persistent cache", () => {
       expect.arrayContaining(["add", "order"]),
     );
   });
+
+  it("avoids weak-schema workflow nonsense and respects public login endpoints", async () => {
+    const specUrl = "https://weak.example.com/openapi.json";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+
+        if (url !== specUrl) {
+          return new Response("Not Found", { status: 404 });
+        }
+
+        return jsonResponse({
+          openapi: "3.0.0",
+          info: {
+            title: "Weak API",
+            version: "1.0.0",
+          },
+          security: [{ bearerAuth: [] }],
+          components: {
+            securitySchemes: {
+              bearerAuth: {
+                type: "http",
+                scheme: "bearer",
+              },
+            },
+          },
+          paths: {
+            "/api/login": {
+              post: {
+                description:
+                  "Gerekli permission: Yok. Bu endpoint herkese açıktır. Başarılı girişte response içinde bir Sanctum token döner.",
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                        },
+                      },
+                    },
+                  },
+                },
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          email: { type: "string" },
+                          password: { type: "string" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/users/store": {
+              post: {
+                description: "Yeni kullanıcı oluşturur.",
+                responses: {
+                  "201": {
+                    description: "Created",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/projects/getAll": {
+              get: {
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
+              head: {
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/projects/delete": {
+              delete: {
+                responses: {
+                  "200": {
+                    description: "Deleted",
+                    content: {
+                      "application/json": {
+                        schema: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/projects/store": {
+              post: {
+                description: "Yeni proje oluşturur.",
+                responses: {
+                  "201": {
+                    description: "Created",
+                    content: {
+                      "application/json": {
+                        schema: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/projects/syncUserPermissions": {
+              post: {
+                description: "Proje kullanıcı yetkilerini günceller.",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["project_id", "user_id", "permission_ids"],
+                        properties: {
+                          project_id: { type: "integer" },
+                          user_id: { type: "integer" },
+                          permission_ids: { type: "array" },
+                        },
+                      },
+                    },
+                  },
+                },
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        });
+      }),
+    );
+
+    const summary = await detectOpenApi(specUrl);
+    const result = await suggestCallSequence({
+      specId: summary.specId,
+      targetMethod: "POST",
+      targetPath: "/api/projects/syncUserPermissions",
+    });
+
+    const steps = result.workflows[0]?.steps ?? [];
+    expect(steps[0]).toMatchObject({
+      method: "POST",
+      path: "/api/login",
+    });
+    expect(steps.at(-1)).toMatchObject({
+      method: "POST",
+      path: "/api/projects/syncUserPermissions",
+    });
+    expect(steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "POST",
+          path: "/api/projects/store",
+        }),
+        expect.objectContaining({ method: "POST", path: "/api/users/store" }),
+      ]),
+    );
+    expect(steps).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "HEAD",
+          path: "/api/projects/getAll",
+        }),
+        expect.objectContaining({
+          method: "DELETE",
+          path: "/api/projects/delete",
+        }),
+      ]),
+    );
+    expect(result.workflows[0]?.missingDependencies).not.toContain(
+      "accessToken",
+    );
+  });
+
+  it("does not treat sibling approval actions as prerequisites without real produced outputs", async () => {
+    const specUrl = "https://approval.example.com/openapi.json";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+
+        if (url !== specUrl) {
+          return new Response("Not Found", { status: 404 });
+        }
+
+        return jsonResponse({
+          openapi: "3.0.0",
+          info: {
+            title: "Approval API",
+            version: "1.0.0",
+          },
+          paths: {
+            "/api/user/autoLogin": {
+              post: {
+                summary: "Auto login",
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/user/bordro/approval/{token}": {
+              get: {
+                summary: "Public approval detail",
+                description: "public endpoint",
+                parameters: [
+                  {
+                    name: "token",
+                    in: "path",
+                    required: true,
+                    schema: { type: "string" },
+                  },
+                ],
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/user/bordro/approval/requestOtp": {
+              post: {
+                summary: "Request OTP",
+                description: "public endpoint",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["token"],
+                        properties: {
+                          token: { type: "string" },
+                        },
+                      },
+                    },
+                  },
+                },
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/user/bordro/approval/approve": {
+              post: {
+                summary: "Approve bordro",
+                description: "public endpoint",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["token", "otp"],
+                        properties: {
+                          token: { type: "string" },
+                          otp: { type: "string" },
+                        },
+                      },
+                    },
+                  },
+                },
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "/api/user/bordro/approval/reject": {
+              post: {
+                summary: "Reject bordro",
+                description: "public endpoint",
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        required: ["token", "otp", "rejection_reason"],
+                        properties: {
+                          token: { type: "string" },
+                          otp: { type: "string" },
+                          rejection_reason: { type: "string" },
+                        },
+                      },
+                    },
+                  },
+                },
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          type: "object",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        });
+      }),
+    );
+
+    const summary = await detectOpenApi(specUrl);
+    const result = await suggestCallSequence({
+      specId: summary.specId,
+      targetMethod: "POST",
+      targetPath: "/api/user/bordro/approval/approve",
+    });
+
+    const steps = result.workflows[0]?.steps ?? [];
+    expect(steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "POST",
+          path: "/api/user/bordro/approval/approve",
+        }),
+      ]),
+    );
+    expect(steps).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "POST",
+          path: "/api/user/bordro/approval/reject",
+        }),
+      ]),
+    );
+  });
 });

@@ -113,6 +113,209 @@ describe("openapi discovery", () => {
     expect(summary.specId).toMatch(/^spec_[a-f0-9]{16}$/);
   });
 
+  it("discovers a Laravel Request Docs style spec from the page directory fallback", async () => {
+    const docsUrl = "https://docs.example.com/request-docs";
+    const specUrl = "https://docs.example.com/request-docs/api?openapi=true";
+    const spec = {
+      openapi: "3.0.0",
+      info: {
+        title: "Laravel Request Docs",
+        version: "1.0.0",
+      },
+      paths: {
+        "/api/login": {
+          post: {
+            summary: "Login",
+            responses: {
+              "200": { description: "OK" },
+            },
+          },
+        },
+      },
+    };
+
+    installFetchMock({
+      [docsUrl]: new Response(
+        "<!DOCTYPE html><html><head><title>LRD</title></head><body><div id='app'></div></body></html>",
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+          },
+        },
+      ),
+      [specUrl]: jsonResponse(spec, specUrl),
+    });
+
+    const summary = await detectOpenApi(docsUrl);
+
+    expect(summary.documentUrl).toBe(specUrl);
+    expect(summary.source).toBe("common-path");
+    expect(summary.endpointCount).toBe(1);
+  });
+
+  it("discovers a Laravel Request Docs spec from a sibling /api input", async () => {
+    const apiInputUrl = "https://docs.example.com/api";
+    const docsUrl = "https://docs.example.com/request-docs";
+    const specUrl = "https://docs.example.com/request-docs/api?openapi=true";
+    const spec = {
+      openapi: "3.0.0",
+      info: {
+        title: "Sibling Docs API",
+        version: "1.0.0",
+      },
+      paths: {
+        "/api/login": {
+          post: {
+            summary: "Login",
+            responses: {
+              "200": { description: "OK" },
+            },
+          },
+        },
+      },
+    };
+
+    installFetchMock({
+      [apiInputUrl]: new Response("Not Found", { status: 404 }),
+      [docsUrl]: new Response(
+        "<!DOCTYPE html><html><head><title>LRD</title></head><body><div id='app'></div></body></html>",
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+          },
+        },
+      ),
+      [specUrl]: jsonResponse(spec, specUrl),
+    });
+
+    const summary = await detectOpenApi(apiInputUrl);
+
+    expect(summary.documentUrl).toBe(specUrl);
+    expect(summary.apiTitle).toBe("Sibling Docs API");
+  });
+
+  it("discovers a versioned v3 OpenAPI path from a docs shell page", async () => {
+    const docsUrl = "https://petstore.example.com/docs";
+    const specUrl = "https://petstore.example.com/api/v3/openapi.json";
+    const spec = {
+      openapi: "3.0.3",
+      info: {
+        title: "Versioned API",
+        version: "3.0.0",
+      },
+      paths: {
+        "/pets": {
+          get: {
+            summary: "List pets",
+            responses: {
+              "200": { description: "OK" },
+            },
+          },
+        },
+      },
+    };
+
+    installFetchMock({
+      [docsUrl]: new Response(
+        "<!DOCTYPE html><html><head><title>Docs</title></head><body><div id='swagger-ui'></div></body></html>",
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+          },
+        },
+      ),
+      [specUrl]: jsonResponse(spec, specUrl),
+    });
+
+    const summary = await detectOpenApi(docsUrl);
+
+    expect(summary.documentUrl).toBe(specUrl);
+    expect(summary.endpointCount).toBe(1);
+  });
+
+  it("discovers a Swagger UI embedded json config url", async () => {
+    const docsUrl = "https://app.example.com/swagger";
+    const specUrl = "https://app.example.com/swagger/v1/swagger.json";
+    const spec = {
+      openapi: "3.0.1",
+      info: {
+        title: "Platform API",
+        version: "v1",
+      },
+      paths: {
+        "/api/health": {
+          get: {
+            summary: "Health",
+            responses: {
+              "200": { description: "OK" },
+            },
+          },
+        },
+      },
+    };
+
+    installFetchMock({
+      [docsUrl]: new Response(
+        `<!doctype html><html><body><script>window.onload=function(){var configObject = JSON.parse('{"urls":[{"url":"/swagger/v1/swagger.json","name":"Platform API v1"}]}'); const ui = SwaggerUIBundle(configObject);}</script></body></html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+          },
+        },
+      ),
+      [specUrl]: jsonResponse(spec, specUrl),
+    });
+
+    const summary = await detectOpenApi(docsUrl);
+
+    expect(summary.documentUrl).toBe(specUrl);
+    expect(summary.apiTitle).toBe("Platform API");
+  });
+
+  it("discovers a Scalar sources url from the docs page", async () => {
+    const docsUrl = "https://app.example.com/scalar";
+    const specUrl = "https://app.example.com/swagger/v1/swagger.json";
+    const spec = {
+      openapi: "3.0.1",
+      info: {
+        title: "Scalar API",
+        version: "v1",
+      },
+      paths: {
+        "/api/auth/login": {
+          post: {
+            summary: "Login",
+            responses: {
+              "200": { description: "OK" },
+            },
+          },
+        },
+      },
+    };
+
+    installFetchMock({
+      [docsUrl]: new Response(
+        `<!doctype html><html><body><script type="module">initialize('%2Fscalar%2F',false,{"sources":[{"title":"v1","url":"swagger/v1/swagger.json"}]},'');</script></body></html>`,
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+          },
+        },
+      ),
+      [specUrl]: jsonResponse(spec, specUrl),
+    });
+
+    const summary = await detectOpenApi(docsUrl);
+
+    expect(summary.documentUrl).toBe(specUrl);
+    expect(summary.apiTitle).toBe("Scalar API");
+  });
+
   it("lists endpoints from a direct YAML spec with filtering", async () => {
     const spec = {
       openapi: "3.0.3",

@@ -256,4 +256,84 @@ describe("endpoint execution", () => {
       orderId: "ord_123",
     });
   });
+
+  it("rewrites localhost server URLs to the detected public origin for docs-generated specs", async () => {
+    const specUrl = "https://public.example.com/request-docs/api?openapi=true";
+    const endpointUrl = "https://public.example.com/api/maintenance-status";
+
+    const fetchMock = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+
+        if (url === specUrl) {
+          return jsonResponse({
+            openapi: "3.0.3",
+            info: {
+              title: "Laravel Request Docs",
+              version: "1.0.0",
+            },
+            servers: [{ url: "http://localhost/api" }],
+            paths: {
+              "/api/maintenance-status": {
+                get: {
+                  responses: {
+                    "200": {
+                      description: "ok",
+                      content: {
+                        "application/json": {
+                          schema: {
+                            type: "object",
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          });
+        }
+
+        if (url === endpointUrl) {
+          expect(init?.method).toBe("GET");
+          return jsonResponse({
+            maintenance: false,
+          });
+        }
+
+        return new Response(`Unexpected URL: ${url}`, { status: 404 });
+      },
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await callOpenApiEndpoint({
+      url: specUrl,
+      method: "GET",
+      path: "/api/maintenance-status",
+      auth: {
+        strategy: "none",
+      },
+    });
+
+    expect(result.request.url).toBe(endpointUrl);
+    expect(result.response.status).toBe(200);
+    expect(result.response.body).toMatchObject({
+      maintenance: false,
+    });
+    expect(fetchMock).toHaveBeenCalled();
+    expect(
+      fetchMock.mock.calls.some((call) =>
+        String(call[0]).includes("localhost"),
+      ),
+    ).toBe(false);
+    expect(
+      fetchMock.mock.calls.some((call) => String(call[0]) === endpointUrl),
+    ).toBe(true);
+  });
 });
