@@ -1,7 +1,7 @@
 {
   "name": "mcp-openapi-discovery",
   "version": "0.1.0",
-  "description": "MCP server that discovers OpenAPI documents from a URL and surfaces endpoint structure.",
+  "description": "MCP server for OpenAPI discovery, endpoint inspection, structured tracing, and authenticated endpoint execution.",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
@@ -28,9 +28,15 @@
     "modelcontextprotocol",
     "openapi",
     "swagger",
+    "api",
+    "discovery",
+    "tracing",
     "laravel"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=18.18.0"
   },
