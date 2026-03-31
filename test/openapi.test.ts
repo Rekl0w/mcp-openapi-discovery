@@ -4,6 +4,7 @@ import {
   detectOpenApi,
   getOpenApiEndpointDetails,
   listOpenApiEndpoints,
+  searchOpenApiEndpoints,
 } from "../src/openapi.js";
 
 function installFetchMock(routes: Record<string, Response>): void {
@@ -109,6 +110,7 @@ describe("openapi discovery", () => {
     expect(summary.apiTitle).toBe("Example API");
     expect(summary.endpointCount).toBe(2);
     expect(summary.tags).toEqual(["users"]);
+    expect(summary.specId).toMatch(/^spec_[a-f0-9]{16}$/);
   });
 
   it("lists endpoints from a direct YAML spec with filtering", async () => {
@@ -265,5 +267,148 @@ describe("openapi discovery", () => {
     expect(result.endpoint.responses[0]).toMatchObject({
       status: "200",
     });
+  });
+
+  it("searches endpoints from cached server-side index using specId", async () => {
+    const specUrl = "https://shop.example.com/openapi.json";
+    installFetchMock({
+      [specUrl]: jsonResponse(
+        {
+          openapi: "3.1.0",
+          info: {
+            title: "Shop API",
+            version: "1.0.0",
+          },
+          paths: {
+            "/orders": {
+              post: {
+                operationId: "createOrder",
+                summary: "Create order",
+                tags: ["orders"],
+                requestBody: {
+                  required: true,
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          customerEmail: { type: "string", format: "email" },
+                          lineItems: {
+                            type: "array",
+                            items: {
+                              type: "object",
+                              properties: {
+                                productId: { type: "string" },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+                responses: {
+                  "201": {
+                    description: "Created",
+                  },
+                },
+              },
+            },
+            "/customers": {
+              get: {
+                summary: "List customers",
+                tags: ["customers"],
+                responses: {
+                  "200": {
+                    description: "OK",
+                  },
+                },
+              },
+            },
+          },
+        },
+        specUrl,
+      ),
+    });
+
+    const summary = await detectOpenApi(specUrl);
+    const result = await searchOpenApiEndpoints(
+      summary.specId,
+      "create order customer email",
+    );
+
+    expect(result.totalMatches).toBeGreaterThanOrEqual(1);
+    expect(result.endpoints[0]).toMatchObject({
+      method: "POST",
+      path: "/orders",
+    });
+    expect(result.endpoints[0]?.matchedTerms).toEqual(
+      expect.arrayContaining(["create", "order", "customer", "email"]),
+    );
+  });
+
+  it("bundles external refs into a searchable local document", async () => {
+    const specUrl = "https://bundled-users.example.com/openapi.json";
+    installFetchMock({
+      [specUrl]: jsonResponse(
+        {
+          openapi: "3.1.0",
+          info: {
+            title: "Bundled API",
+            version: "1.0.0",
+          },
+          paths: {
+            "/users/{id}": {
+              get: {
+                summary: "Get user",
+                parameters: [
+                  {
+                    name: "id",
+                    in: "path",
+                    required: true,
+                    schema: { type: "string" },
+                  },
+                ],
+                responses: {
+                  "200": {
+                    description: "OK",
+                    content: {
+                      "application/json": {
+                        schema: {
+                          $ref: "./components/schemas.json#/User",
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        specUrl,
+      ),
+      "https://bundled-users.example.com/components/schemas.json": jsonResponse(
+        {
+          User: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              email: { type: "string", format: "email" },
+            },
+          },
+        },
+        "https://bundled-users.example.com/components/schemas.json",
+      ),
+    });
+
+    const result = await getOpenApiEndpointDetails(
+      specUrl,
+      "GET",
+      "/users/{id}",
+    );
+
+    expect(
+      result.endpoint.responses[0]?.entries[0]?.schema?.propertyKeys,
+    ).toEqual(expect.arrayContaining(["id", "email"]));
   });
 });

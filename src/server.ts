@@ -3,6 +3,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import {
   detectOpenApi,
+  formatEndpointSearchResults,
   formatDiscoverySummary,
   formatEndpointDetail,
   formatEndpointList,
@@ -10,8 +11,9 @@ import {
   formatRelatedEndpoints,
   getOpenApiEndpointDetails,
   listOpenApiEndpoints,
-  traceParameterUsage,
   findRelatedEndpoints,
+  searchOpenApiEndpoints,
+  traceParameterUsage,
 } from "./openapi.js";
 import { callOpenApiEndpoint, formatCallEndpointResult } from "./request.js";
 
@@ -140,6 +142,73 @@ export function createServer(): McpServer {
       } catch (error) {
         return createErrorResult(
           error instanceof Error ? error.message : "Endpoint listing failed.",
+        );
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_endpoints",
+    {
+      description:
+        "Search cached endpoints for a previously detected OpenAPI spec using a server-side semantic-style scorer over endpoint metadata and schema field names.",
+      inputSchema: {
+        specId: z.string().describe("Spec ID returned by detect_openapi"),
+        query: z
+          .string()
+          .describe(
+            "Natural-language or keyword query, e.g. create user email",
+          ),
+        tag: z.string().optional().describe("Optional tag filter, e.g. users"),
+        method: z
+          .enum([
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS",
+            "HEAD",
+            "TRACE",
+          ])
+          .optional()
+          .describe("Optional HTTP method filter"),
+        includeDeprecated: z
+          .boolean()
+          .optional()
+          .describe("Include deprecated endpoints; defaults to true"),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe(
+            "Maximum number of search results to return; defaults to 10",
+          ),
+      },
+    },
+    async ({ specId, query, tag, method, includeDeprecated, limit }) => {
+      try {
+        const result = await searchOpenApiEndpoints(specId, query, {
+          tag,
+          method,
+          includeDeprecated,
+          limit,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatEndpointSearchResults(result),
+            },
+          ],
+          structuredContent: toStructuredContent(result),
+        } satisfies CallToolResult;
+      } catch (error) {
+        return createErrorResult(
+          error instanceof Error ? error.message : "Endpoint search failed.",
         );
       }
     },

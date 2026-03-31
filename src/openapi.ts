@@ -1,3 +1,5 @@
+import SwaggerParser from "@apidevtools/swagger-parser";
+import { createHash } from "node:crypto";
 import { parse as parseYaml } from "yaml";
 
 type JsonObject = Record<string, unknown>;
@@ -48,8 +50,26 @@ const USER_AGENT = "mcp-openapi-discovery/0.1.0";
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_CANDIDATES = 30;
 const MAX_SCHEMA_PROPERTIES = 12;
+const DEFAULT_SEARCH_LIMIT = 10;
+const MAX_SEARCH_LIMIT = 50;
+const SEARCH_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "api",
+  "endpoint",
+  "for",
+  "in",
+  "of",
+  "on",
+  "or",
+  "the",
+  "to",
+  "with",
+]);
 
 export interface DiscoverySummary {
+  specId: string;
   inputUrl: string;
   documentUrl: string;
   pageUrl?: string;
@@ -201,6 +221,11 @@ export interface RelatedEndpointMatch {
   reasons: string[];
 }
 
+export interface EndpointSearchMatch extends EndpointSummary {
+  score: number;
+  matchedTerms: string[];
+}
+
 interface CandidateUrl {
   url: string;
   source: DiscoverySummary["source"];
@@ -222,8 +247,20 @@ interface ParseSuccess {
 }
 
 interface ResolvedDocument {
+  specId: string;
   discovery: DiscoverySummary;
   document: OpenApiDocument;
+  endpoints: EndpointSummary[];
+  searchDocuments: EndpointSearchDocument[];
+}
+
+interface EndpointSearchDocument {
+  endpoint: EndpointSummary;
+  searchText: string;
+  primaryTokens: string[];
+  parameterTokens: string[];
+  requestTokens: string[];
+  responseTokens: string[];
 }
 
 type OpenApiDocument = JsonObject & {
@@ -239,6 +276,7 @@ type OpenApiDocument = JsonObject & {
 };
 
 const documentCache = new Map<string, Promise<ResolvedDocument>>();
+const specCache = new Map<string, ResolvedDocument>();
 
 export async function detectOpenApi(url: string): Promise<DiscoverySummary> {
   const resolved = await loadResolvedDocument(url);
@@ -261,7 +299,7 @@ export async function listOpenApiEndpoints(
   endpoints: EndpointSummary[];
 }> {
   const resolved = await loadResolvedDocument(url);
-  const endpoints = extractEndpoints(resolved.document);
+  const endpoints = resolved.endpoints;
   const normalizedMethod = normalizeMethod(filters.method);
   const tagFilter = filters.tag?.trim().toLowerCase();
   const pathFilter = filters.pathContains?.trim().toLowerCase();
@@ -301,6 +339,99 @@ export async function listOpenApiEndpoints(
     totalEndpoints: endpoints.length,
     matchedEndpoints: filtered.length,
     endpoints: filtered.slice(0, limit),
+  };
+}
+
+export async function searchOpenApiEndpoints(
+  specId: string,
+  query: string,
+  filters: {
+    tag?: string;
+    method?: string;
+    includeDeprecated?: boolean;
+    limit?: number;
+  } = {},
+): Promise<{
+  discovery: DiscoverySummary;
+  search: {
+    specId: string;
+    query: string;
+  };
+  totalMatches: number;
+  endpoints: EndpointSearchMatch[];
+}> {
+  const resolved = specCache.get(specId);
+
+  if (!resolved) {
+    throw new Error(
+      `Unknown specId: ${specId}. Run detect_openapi first so the spec is loaded into server memory.`,
+    );
+  }
+
+  const queryTokens = tokenizeSearchText(query);
+  if (queryTokens.length === 0) {
+    throw new Error("Search query must include at least one searchable term.");
+  }
+
+  const normalizedMethod = normalizeMethod(filters.method);
+  const tagFilter = filters.tag?.trim().toLowerCase();
+  const includeDeprecated = filters.includeDeprecated ?? true;
+  const limit = Math.max(
+    1,
+    Math.min(filters.limit ?? DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+  );
+  const normalizedPhrase = normalizeSearchText(query).trim();
+
+  const matches = resolved.searchDocuments
+    .filter(({ endpoint }) => {
+      if (normalizedMethod && endpoint.method !== normalizedMethod) {
+        return false;
+      }
+
+      if (!includeDeprecated && endpoint.deprecated) {
+        return false;
+      }
+
+      if (
+        tagFilter &&
+        !endpoint.tags.some((tag) => tag.toLowerCase().includes(tagFilter))
+      ) {
+        return false;
+      }
+
+      return true;
+    })
+    .map((searchDocument) =>
+      scoreSearchDocument(searchDocument, queryTokens, normalizedPhrase),
+    )
+    .filter(
+      (
+        match,
+      ): match is {
+        endpoint: EndpointSummary;
+        score: number;
+        matchedTerms: string[];
+      } => Boolean(match),
+    )
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        left.endpoint.path.localeCompare(right.endpoint.path) ||
+        left.endpoint.method.localeCompare(right.endpoint.method),
+    );
+
+  return {
+    discovery: resolved.discovery,
+    search: {
+      specId,
+      query,
+    },
+    totalMatches: matches.length,
+    endpoints: matches.slice(0, limit).map((match) => ({
+      ...match.endpoint,
+      score: match.score,
+      matchedTerms: match.matchedTerms,
+    })),
   };
 }
 
@@ -662,6 +793,7 @@ export async function findRelatedEndpoints(
 export function formatDiscoverySummary(summary: DiscoverySummary): string {
   const lines = [
     `API: ${summary.apiTitle}${summary.apiVersion ? ` (version ${summary.apiVersion})` : ""}`,
+    `Spec ID: ${summary.specId}`,
     `Spec: ${summary.openapiVersion} • ${summary.format.toUpperCase()}`,
     `Document URL: ${summary.documentUrl}`,
     `Detected via: ${summary.source}`,
@@ -865,6 +997,45 @@ export function formatRelatedEndpoints(result: {
       `- ${endpoint.method} ${endpoint.path} (score: ${endpoint.score})${endpoint.summary ? ` — ${endpoint.summary}` : ""}`,
     );
     lines.push(`  ${endpoint.reasons.join(" • ")}`);
+  }
+
+  return lines.join("\n");
+}
+
+export function formatEndpointSearchResults(result: {
+  search: {
+    specId: string;
+    query: string;
+  };
+  totalMatches: number;
+  endpoints: EndpointSearchMatch[];
+}): string {
+  const lines = [
+    `Search query: ${result.search.query}`,
+    `Spec ID: ${result.search.specId}`,
+    `Matches: ${result.totalMatches}`,
+  ];
+
+  if (result.endpoints.length === 0) {
+    lines.push("No endpoints matched the search query.");
+    return lines.join("\n");
+  }
+
+  for (const endpoint of result.endpoints) {
+    lines.push(
+      `- ${endpoint.method} ${endpoint.path} (score: ${endpoint.score.toFixed(2)})${endpoint.summary ? ` — ${endpoint.summary}` : ""}`,
+    );
+
+    const extras: string[] = [];
+    if (endpoint.tags.length > 0) {
+      extras.push(`tags: ${endpoint.tags.join(", ")}`);
+    }
+    if (endpoint.matchedTerms.length > 0) {
+      extras.push(`matched: ${endpoint.matchedTerms.join(", ")}`);
+    }
+    if (extras.length > 0) {
+      lines.push(`  ${extras.join(" • ")}`);
+    }
   }
 
   return lines.join("\n");
@@ -1397,11 +1568,15 @@ async function discoverOpenApiDocument(
 
     const directSpec = tryParseOpenApiDocument(fetched.body);
     if (directSpec) {
+      const bundledDoc = await bundleOpenApiDocument(
+        fetched.finalUrl,
+        directSpec.doc,
+      );
       return buildResolvedDocument(
         candidate,
         fetched.finalUrl,
         directSpec,
-        directSpec.doc,
+        bundledDoc,
         inputUrl,
       );
     }
@@ -1442,6 +1617,8 @@ function buildResolvedDocument(
   doc: OpenApiDocument,
   inputUrl: string,
 ): ResolvedDocument {
+  const specId = buildSpecId(documentUrl);
+  const endpoints = extractEndpoints(doc);
   const tags = Array.isArray(doc.tags)
     ? doc.tags
         .map((tag: unknown) =>
@@ -1451,6 +1628,7 @@ function buildResolvedDocument(
     : collectEndpointTags(doc);
 
   const discovery: DiscoverySummary = {
+    specId,
     inputUrl,
     documentUrl,
     pageUrl: candidate.pageUrl,
@@ -1466,14 +1644,21 @@ function buildResolvedDocument(
     apiVersion: readInfoString(doc, "version"),
     servers: collectServerUrls(doc, undefined, undefined, documentUrl),
     tags,
-    endpointCount: extractEndpoints(doc).length,
+    endpointCount: endpoints.length,
     discoveryTrail: candidate.trail,
   };
 
-  return {
+  const resolved: ResolvedDocument = {
+    specId,
     discovery,
     document: doc,
+    endpoints,
+    searchDocuments: buildEndpointSearchDocuments(doc, documentUrl),
   };
+
+  specCache.set(specId, resolved);
+
+  return resolved;
 }
 
 function buildInitialCandidates(inputUrl: URL): CandidateUrl[] {
@@ -1622,6 +1807,42 @@ function tryParseYaml(text: string): OpenApiDocument | undefined {
   }
 }
 
+async function bundleOpenApiDocument(
+  documentUrl: string,
+  fallbackDoc: OpenApiDocument,
+): Promise<OpenApiDocument> {
+  try {
+    const bundled = await SwaggerParser.bundle(documentUrl, {
+      resolve: {
+        http: createHttpResolver(),
+        https: createHttpResolver(),
+      },
+    });
+
+    return isObject(bundled) ? (bundled as OpenApiDocument) : fallbackDoc;
+  } catch {
+    return fallbackDoc;
+  }
+}
+
+function createHttpResolver(): {
+  order: number;
+  canRead: RegExp;
+  read(file: { url: string }): Promise<string>;
+} {
+  return {
+    order: 1,
+    canRead: /^https?:/i,
+    async read(file: { url: string }): Promise<string> {
+      const fetched = await fetchText(file.url);
+      if (!fetched.ok) {
+        throw new Error(`Failed to fetch OpenAPI reference: ${file.url}`);
+      }
+      return fetched.body;
+    },
+  };
+}
+
 function isOpenApiRoot(value: OpenApiDocument): boolean {
   const hasVersion =
     typeof value.openapi === "string" || typeof value.swagger === "string";
@@ -1728,6 +1949,330 @@ function extractEndpoints(doc: OpenApiDocument): EndpointSummary[] {
       left.path.localeCompare(right.path) ||
       left.method.localeCompare(right.method),
   );
+}
+
+function buildEndpointSearchDocuments(
+  doc: OpenApiDocument,
+  documentUrl: string,
+): EndpointSearchDocument[] {
+  const paths = isObject(doc.paths) ? doc.paths : {};
+  const documents: EndpointSearchDocument[] = [];
+
+  for (const [path, pathItem] of Object.entries(paths)) {
+    if (!isObject(pathItem)) {
+      continue;
+    }
+
+    for (const method of HTTP_METHODS) {
+      const operation = pathItem[method];
+      if (!isObject(operation)) {
+        continue;
+      }
+
+      const upperMethod = method.toUpperCase() as Uppercase<HttpMethod>;
+      const context = getOperationContext(doc, upperMethod, path, documentUrl);
+      if (!context) {
+        continue;
+      }
+
+      const fields = collectEndpointSearchFields({
+        doc,
+        pathItem,
+        operation,
+      });
+      const primaryText = normalizeSearchText(
+        [
+          context.endpoint.method,
+          context.endpoint.path,
+          context.endpoint.operationId,
+          context.endpoint.summary,
+          context.endpoint.description,
+          context.endpoint.tags.join(" "),
+        ]
+          .filter(Boolean)
+          .join(" "),
+      );
+      const parameterText = normalizeSearchText(fields.parameters.join(" "));
+      const requestText = normalizeSearchText(fields.request.join(" "));
+      const responseText = normalizeSearchText(fields.responses.join(" "));
+      const searchText = [primaryText, parameterText, requestText, responseText]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+
+      documents.push({
+        endpoint: context.endpoint,
+        searchText,
+        primaryTokens: tokenizeSearchText(primaryText),
+        parameterTokens: tokenizeSearchText(parameterText),
+        requestTokens: tokenizeSearchText(requestText),
+        responseTokens: tokenizeSearchText(responseText),
+      });
+    }
+  }
+
+  return documents.sort(
+    (left, right) =>
+      left.endpoint.path.localeCompare(right.endpoint.path) ||
+      left.endpoint.method.localeCompare(right.endpoint.method),
+  );
+}
+
+function collectEndpointSearchFields(input: {
+  doc: OpenApiDocument;
+  pathItem: JsonObject;
+  operation: JsonObject;
+}): {
+  parameters: string[];
+  request: string[];
+  responses: string[];
+} {
+  const parameters = summarizeParameters(
+    input.doc,
+    input.pathItem,
+    input.operation,
+  ).flatMap((parameter) => [parameter.name, parameter.schema?.refName]);
+
+  const request = new Set<string>();
+  const requestBody = resolveMaybeRef(input.doc, input.operation.requestBody);
+
+  if (isObject(requestBody) && isObject(requestBody.content)) {
+    for (const [contentType, mediaType] of Object.entries(
+      requestBody.content,
+    )) {
+      request.add(contentType);
+      if (isObject(mediaType)) {
+        for (const fieldPath of collectSchemaFieldPaths({
+          doc: input.doc,
+          schemaValue: mediaType.schema,
+        })) {
+          request.add(fieldPath);
+        }
+      }
+    }
+  }
+
+  const swaggerBodyParameter = extractParametersArray(
+    input.operation.parameters,
+  )
+    .map((parameter) => resolveParameter(input.doc, parameter))
+    .find((parameter) => isObject(parameter) && parameter.in === "body");
+  if (swaggerBodyParameter && isObject(swaggerBodyParameter)) {
+    for (const fieldPath of collectSchemaFieldPaths({
+      doc: input.doc,
+      schemaValue: swaggerBodyParameter.schema,
+    })) {
+      request.add(fieldPath);
+    }
+  }
+
+  const formDataParameters = extractParametersArray(input.operation.parameters)
+    .map((parameter) => resolveParameter(input.doc, parameter))
+    .filter(
+      (parameter): parameter is JsonObject =>
+        isObject(parameter) && parameter.in === "formData",
+    );
+  for (const parameter of formDataParameters) {
+    if (typeof parameter.name === "string") {
+      request.add(parameter.name);
+    }
+  }
+
+  const responses = new Set<string>();
+  const responseMap = isObject(input.operation.responses)
+    ? input.operation.responses
+    : {};
+  for (const [status, responseValue] of Object.entries(responseMap)) {
+    responses.add(status);
+    const response = resolveMaybeRef(input.doc, responseValue);
+    if (!isObject(response) || !isObject(response.content)) {
+      continue;
+    }
+
+    for (const [contentType, mediaType] of Object.entries(response.content)) {
+      responses.add(contentType);
+      if (!isObject(mediaType)) {
+        continue;
+      }
+
+      for (const fieldPath of collectSchemaFieldPaths({
+        doc: input.doc,
+        schemaValue: mediaType.schema,
+      })) {
+        responses.add(fieldPath);
+      }
+    }
+  }
+
+  return {
+    parameters: parameters.filter((value): value is string => Boolean(value)),
+    request: [...request],
+    responses: [...responses],
+  };
+}
+
+function collectSchemaFieldPaths(input: {
+  doc: OpenApiDocument;
+  schemaValue: unknown;
+  currentPath?: string;
+  visitedRefs?: Set<string>;
+}): string[] {
+  const schemaObject = isObject(input.schemaValue)
+    ? input.schemaValue
+    : undefined;
+  const ref =
+    typeof schemaObject?.$ref === "string" ? schemaObject.$ref : undefined;
+  const resolved = resolveMaybeRef(input.doc, input.schemaValue);
+
+  if (!isObject(resolved)) {
+    return [];
+  }
+
+  const visitedRefs = new Set(input.visitedRefs ?? []);
+  if (ref) {
+    if (visitedRefs.has(ref)) {
+      return [];
+    }
+    visitedRefs.add(ref);
+  }
+
+  const fields = new Set<string>();
+  const properties = isObject(resolved.properties)
+    ? resolved.properties
+    : undefined;
+
+  if (properties) {
+    for (const [propertyName, propertySchema] of Object.entries(properties)) {
+      const fieldPath = input.currentPath
+        ? `${input.currentPath}.${propertyName}`
+        : propertyName;
+      fields.add(propertyName);
+      fields.add(fieldPath);
+
+      for (const nestedField of collectSchemaFieldPaths({
+        ...input,
+        schemaValue: propertySchema,
+        currentPath: fieldPath,
+        visitedRefs,
+      })) {
+        fields.add(nestedField);
+      }
+    }
+  }
+
+  if (isObject(resolved.items)) {
+    for (const nestedField of collectSchemaFieldPaths({
+      ...input,
+      schemaValue: resolved.items,
+      currentPath: input.currentPath ? `${input.currentPath}[]` : "[]",
+      visitedRefs,
+    })) {
+      fields.add(nestedField);
+    }
+  }
+
+  for (const key of ["allOf", "oneOf", "anyOf"] as const) {
+    const values = resolved[key];
+    if (!Array.isArray(values)) {
+      continue;
+    }
+
+    for (const schemaEntry of values) {
+      for (const nestedField of collectSchemaFieldPaths({
+        ...input,
+        schemaValue: schemaEntry,
+        visitedRefs,
+      })) {
+        fields.add(nestedField);
+      }
+    }
+  }
+
+  return [...fields];
+}
+
+function scoreSearchDocument(
+  document: EndpointSearchDocument,
+  queryTokens: string[],
+  normalizedPhrase: string,
+):
+  | {
+      endpoint: EndpointSummary;
+      score: number;
+      matchedTerms: string[];
+    }
+  | undefined {
+  const primary = new Set(document.primaryTokens);
+  const parameters = new Set(document.parameterTokens);
+  const request = new Set(document.requestTokens);
+  const responses = new Set(document.responseTokens);
+  const matchedTerms = new Set<string>();
+  let score = 0;
+
+  for (const token of queryTokens) {
+    if (primary.has(token)) {
+      score += token === document.endpoint.method.toLowerCase() ? 2.5 : 2;
+      matchedTerms.add(token);
+      continue;
+    }
+
+    if (parameters.has(token)) {
+      score += 1.5;
+      matchedTerms.add(token);
+      continue;
+    }
+
+    if (request.has(token) || responses.has(token)) {
+      score += 1;
+      matchedTerms.add(token);
+      continue;
+    }
+
+    if (document.searchText.includes(token)) {
+      score += 0.5;
+      matchedTerms.add(token);
+    }
+  }
+
+  if (matchedTerms.size === 0) {
+    return undefined;
+  }
+
+  let normalizedScore = score / Math.max(queryTokens.length, 1);
+  if (normalizedPhrase && document.searchText.includes(normalizedPhrase)) {
+    normalizedScore += 0.5;
+  }
+
+  return {
+    endpoint: document.endpoint,
+    score: Number(normalizedScore.toFixed(3)),
+    matchedTerms: [...matchedTerms],
+  };
+}
+
+function tokenizeSearchText(value: string): string[] {
+  if (!value.trim()) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      normalizeSearchText(value)
+        .split(/\s+/)
+        .filter((token) => token.length > 1 && !SEARCH_STOP_WORDS.has(token)),
+    ),
+  ];
+}
+
+function normalizeSearchText(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .toLowerCase();
+}
+
+function buildSpecId(documentUrl: string): string {
+  return `spec_${createHash("sha256").update(documentUrl).digest("hex").slice(0, 16)}`;
 }
 
 function extractEndpointDetail(

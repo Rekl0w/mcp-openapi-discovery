@@ -1,6 +1,6 @@
 {
   "name": "@rekl0w/mcp-openapi-discovery",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for OpenAPI discovery, endpoint inspection, structured tracing, and authenticated endpoint execution.",
   "homepage": "https://github.com/Rekl0w/mcp-openapi-discovery#readme",
   "type": "module",
@@ -49,6 +49,7 @@
     "node": ">=18.18.0"
   },
   "dependencies": {
+    "@apidevtools/swagger-parser": "^12.1.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cheerio": "^1.1.2",
     "yaml": "^2.8.1",

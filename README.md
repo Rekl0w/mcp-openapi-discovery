@@ -28,11 +28,14 @@ It is especially useful for:
 ## Features
 
 - Detect OpenAPI / Swagger specs from docs pages or direct spec URLs
+- Assign a stable in-memory `specId` for each detected spec so later tools can work without re-exposing the full document
 - Summarize API metadata, servers, tags, and endpoint counts
 - List endpoints with filtering by method, tag, or path fragment
+- Search endpoints server-side with weighted matching across methods, paths, tags, summaries, parameters, and schema field names
 - Inspect request / response details for a specific endpoint
 - Trace where identifiers like `userId`, `accountId`, or `teamId` appear across parameters and schemas
 - Find endpoints that are structurally related to another endpoint
+- Bundle external `$ref` files and remote schema references into a local in-memory document before analysis
 - Execute endpoints with:
   - path params
   - query params
@@ -50,14 +53,13 @@ It is especially useful for:
 
 ## Available MCP tools
 
-| Tool                     | Description                                                                                            |
-| ------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `detect_openapi`         | Detects the OpenAPI document behind a docs page or spec URL and returns a summary                      |
-| `list_endpoints`         | Lists endpoints with optional filtering                                                                |
-| `get_endpoint_details`   | Returns request / response details for a single endpoint                                               |
-| `trace_parameter_usage`  | Traces where a parameter or field is used across parameters, request bodies, and response bodies       |
-| `find_related_endpoints` | Finds endpoints related to a source endpoint through shared resources, identifiers, and path structure |
-| `call_endpoint`          | Executes a real request against an endpoint discovered from the OpenAPI document                       |
+- `detect_openapi`: detects the OpenAPI document behind a docs page or spec URL and returns a summary
+- `list_endpoints`: lists endpoints with optional filtering
+- `search_endpoints`: searches cached endpoints for a detected spec using server-side weighted scoring
+- `get_endpoint_details`: returns request / response details for a single endpoint
+- `trace_parameter_usage`: traces where a parameter or field is used across parameters, request bodies, and response bodies
+- `find_related_endpoints`: finds endpoints related to a source endpoint through shared resources, identifiers, and path structure
+- `call_endpoint`: executes a real request against an endpoint discovered from the OpenAPI document
 
 ## Requirements
 
@@ -164,6 +166,7 @@ Add this to `%APPDATA%\Claude\claude_desktop_config.json`:
 ## Example use cases
 
 - Detect the spec behind `https://example.com/docs`
+- Detect a spec, keep the returned `specId`, and search only the most relevant endpoints
 - List endpoints from `https://api.example.com/openapi.json`
 - Inspect the `PUT /users/{id}` endpoint
 - Filter only `POST` endpoints tagged with `users`
@@ -180,7 +183,7 @@ Beyond plain endpoint listing, this server can help answer questions like:
 - “Which endpoints are related to `GET /users/{id}`?”
 - “Is this identifier coming from a response body, a query parameter, or a path parameter?”
 
-This is intentionally more structured than pure semantic search. Instead of only doing natural-language similarity, the server can inspect:
+This now combines structured analysis with lightweight server-side endpoint search. Instead of only doing natural-language similarity on the client, the server can inspect and score:
 
 - path parameters
 - query parameters
@@ -188,6 +191,26 @@ This is intentionally more structured than pure semantic search. Instead of only
 - response body fields
 - shared resource names in paths
 - shared identifier patterns such as `userId`, `accountId`, `teamId`, or entity-specific `id` fields
+
+### `specId` + `search_endpoints` flow
+
+Run `detect_openapi` first and keep the returned `specId`.
+
+Then call `search_endpoints` with that `specId` and a natural-language query such as:
+
+- `create user email`
+- `refresh bearer token`
+- `order status update`
+
+The server builds a searchable text index per endpoint from:
+
+- HTTP method and path
+- operationId, summary, description, and tags
+- parameter names
+- request body field names
+- response body field names
+
+This keeps endpoint retrieval on the server side and returns only the top matches.
 
 ### Example tracing queries
 
@@ -302,7 +325,7 @@ This runs:
 
 - Runtime: Node.js 18+
 - MCP SDK: `@modelcontextprotocol/sdk` v1
-- Spec parsing: JSON / YAML + HTML discovery heuristics
+- Spec parsing: JSON / YAML + HTML discovery heuristics + bundled external `$ref` support
 - Request execution: real HTTP requests with automatic auth handling
 - Test runner: `vitest`
 
@@ -326,10 +349,7 @@ If you want to contribute:
 
 ## Roadmap
 
-- `search_endpoints` tool
-- optional semantic-search layer on top of structured tracing
 - broader Swagger UI / Scalar detection patterns
-- external `$ref` resolution support
 - richer Laravel-specific API summaries
 - optional Streamable HTTP transport support
 
