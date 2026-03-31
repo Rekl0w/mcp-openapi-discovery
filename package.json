@@ -1,0 +1,49 @@
+{
+  "name": "mcp-openapi-discovery",
+  "version": "0.1.0",
+  "description": "MCP server that discovers OpenAPI documents from a URL and surfaces endpoint structure.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "mcp-openapi-discovery": "./dist/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run build && npm run test",
+    "prepublishOnly": "npm run check"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "openapi",
+    "swagger",
+    "laravel"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cheerio": "^1.1.2",
+    "yaml": "^2.8.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
