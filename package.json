@@ -1,5 +1,5 @@
 {
-  "name": "mcp-openapi-discovery",
+  "name": "@rekl0w/mcp-openapi-discovery",
   "version": "0.1.0",
   "description": "MCP server for OpenAPI discovery, endpoint inspection, structured tracing, and authenticated endpoint execution.",
   "homepage": "https://github.com/Rekl0w/mcp-openapi-discovery#readme",

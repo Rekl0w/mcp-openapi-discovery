@@ -1,6 +1,6 @@
-# mcp-openapi-discovery
+# @rekl0w/mcp-openapi-discovery
 
-`mcp-openapi-discovery` is a TypeScript MCP server that can:
+`@rekl0w/mcp-openapi-discovery` is a TypeScript MCP server that can:
 
 - detect OpenAPI / Swagger documents from a URL,
 - inspect and summarize endpoints,
@@ -46,14 +46,14 @@ It is especially useful for:
 
 ## Available MCP tools
 
-| Tool | Description |
-| --- | --- |
-| `detect_openapi` | Detects the OpenAPI document behind a docs page or spec URL and returns a summary |
-| `list_endpoints` | Lists endpoints with optional filtering |
-| `get_endpoint_details` | Returns request / response details for a single endpoint |
-| `trace_parameter_usage` | Traces where a parameter or field is used across parameters, request bodies, and response bodies |
+| Tool                     | Description                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `detect_openapi`         | Detects the OpenAPI document behind a docs page or spec URL and returns a summary                      |
+| `list_endpoints`         | Lists endpoints with optional filtering                                                                |
+| `get_endpoint_details`   | Returns request / response details for a single endpoint                                               |
+| `trace_parameter_usage`  | Traces where a parameter or field is used across parameters, request bodies, and response bodies       |
 | `find_related_endpoints` | Finds endpoints related to a source endpoint through shared resources, identifiers, and path structure |
-| `call_endpoint` | Executes a real request against an endpoint discovered from the OpenAPI document |
+| `call_endpoint`          | Executes a real request against an endpoint discovered from the OpenAPI document                       |
 
 ## Requirements
 
@@ -94,9 +94,7 @@ Add this to `%APPDATA%\Claude\claude_desktop_config.json`:
   "mcpServers": {
     "openapi-discovery": {
       "command": "node",
-      "args": [
-        "C:/absolute/path/to/project/dist/index.js"
-      ]
+      "args": ["C:/absolute/path/to/project/dist/index.js"]
     }
   }
 }
