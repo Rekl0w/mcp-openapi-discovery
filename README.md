@@ -16,7 +16,6 @@ Published package:
 Release resources:
 
 - GitHub Releases: [Rekl0w/mcp-openapi-discovery releases](https://github.com/Rekl0w/mcp-openapi-discovery/releases)
-- Upcoming `v0.3.2` notes: [`releases/v0.3.2.md`](releases/v0.3.2.md)
 
 ## Why this project exists
 
