@@ -100,6 +100,7 @@ const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
 const CACHE_SCHEMA_VERSION = 2;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_CACHE_REVALIDATE_MS = 0;
 const CACHE_DIR_NAME = ".mcp-openapi-discovery-cache";
 const DEFAULT_WORKFLOW_LIMIT = 3;
 const MAX_WORKFLOW_LIMIT = 5;
@@ -408,6 +409,18 @@ interface CachedDocumentRecord {
   resolved: ResolvedDocument;
 }
 
+interface DocumentCacheEntry {
+  promise: Promise<ResolvedDocument>;
+  lastValidatedAt: number;
+  pending: boolean;
+}
+
+interface SpecCacheEntry {
+  normalizedInput: string;
+  resolved: ResolvedDocument;
+  lastValidatedAt: number;
+}
+
 type OpenApiDocument = JsonObject & {
   openapi?: string;
   swagger?: string;
@@ -420,8 +433,8 @@ type OpenApiDocument = JsonObject & {
   produces?: string[];
 };
 
-const documentCache = new Map<string, Promise<ResolvedDocument>>();
-const specCache = new Map<string, ResolvedDocument>();
+const documentCache = new Map<string, DocumentCacheEntry>();
+const specCache = new Map<string, SpecCacheEntry>();
 
 export async function detectOpenApi(url: string): Promise<DiscoverySummary> {
   const resolved = await loadResolvedDocument(url);
@@ -1833,7 +1846,7 @@ async function loadResolvedDocumentBySpecId(
 ): Promise<ResolvedDocument | undefined> {
   const cached = specCache.get(specId);
   if (cached) {
-    return cached;
+    return loadResolvedDocument(cached.normalizedInput);
   }
 
   const persisted = await readCachedDocumentBySpecId(specId);
@@ -1841,8 +1854,12 @@ async function loadResolvedDocumentBySpecId(
     return undefined;
   }
 
-  hydrateResolvedDocument(persisted.normalizedInput, persisted.resolved);
-  return persisted.resolved;
+  hydrateResolvedDocument(
+    persisted.normalizedInput,
+    persisted.resolved,
+    parseCacheTimestamp(persisted.cachedAt),
+  );
+  return loadResolvedDocument(persisted.normalizedInput);
 }
 
 async function loadResolvedDocument(
@@ -1852,15 +1869,34 @@ async function loadResolvedDocument(
   const cached = documentCache.get(normalizedInput);
 
   if (cached) {
-    return cached;
+    if (cached.pending || !shouldRevalidateCache(cached.lastValidatedAt)) {
+      return cached.promise;
+    }
+
+    const refreshPromise = cached.promise
+      .then((resolved) => refreshResolvedDocument(normalizedInput, resolved))
+      .catch((error) => {
+        documentCache.delete(normalizedInput);
+        throw error;
+      });
+
+    documentCache.set(normalizedInput, {
+      promise: refreshPromise,
+      lastValidatedAt: cached.lastValidatedAt,
+      pending: true,
+    });
+
+    return refreshPromise;
   }
 
   const persisted = await readCachedDocumentByInput(normalizedInput);
   if (persisted) {
-    hydrateResolvedDocument(normalizedInput, persisted.resolved);
-    const hydrated = Promise.resolve(persisted.resolved);
-    documentCache.set(normalizedInput, hydrated);
-    return persisted.resolved;
+    hydrateResolvedDocument(
+      normalizedInput,
+      persisted.resolved,
+      parseCacheTimestamp(persisted.cachedAt),
+    );
+    return loadResolvedDocument(normalizedInput);
   }
 
   const promise = discoverOpenApiDocument(normalizedInput).catch((error) => {
@@ -1868,8 +1904,141 @@ async function loadResolvedDocument(
     throw error;
   });
 
-  documentCache.set(normalizedInput, promise);
+  documentCache.set(normalizedInput, {
+    promise,
+    lastValidatedAt: Date.now(),
+    pending: true,
+  });
   return promise;
+}
+
+async function refreshResolvedDocument(
+  normalizedInput: string,
+  cached: ResolvedDocument,
+): Promise<ResolvedDocument> {
+  try {
+    const refreshed = await refreshResolvedDocumentFromCanonicalSource(
+      normalizedInput,
+      cached,
+    );
+    hydrateResolvedDocument(normalizedInput, refreshed, Date.now());
+    return refreshed;
+  } catch {
+    try {
+      const rediscovered = await discoverOpenApiDocument(normalizedInput);
+      hydrateResolvedDocument(normalizedInput, rediscovered, Date.now());
+      return rediscovered;
+    } catch {
+      hydrateResolvedDocument(normalizedInput, cached, Date.now());
+      return cached;
+    }
+  }
+}
+
+async function refreshResolvedDocumentFromCanonicalSource(
+  normalizedInput: string,
+  cached: ResolvedDocument,
+): Promise<ResolvedDocument> {
+  const fetched = await fetchText(cached.discovery.documentUrl);
+  if (!fetched.ok) {
+    throw new Error(
+      `Canonical OpenAPI document returned ${fetched.status} for ${cached.discovery.documentUrl}`,
+    );
+  }
+
+  const cachedHash = hashOpenApiDocument(cached.document);
+  const candidate: CandidateUrl = {
+    url: cached.discovery.documentUrl,
+    source: cached.discovery.source,
+    trail: cached.discovery.discoveryTrail,
+    pageUrl: cached.discovery.pageUrl,
+  };
+
+  const directSpec = tryParseOpenApiDocument(fetched.body);
+  if (directSpec) {
+    const bundledDoc = await bundleOpenApiDocument(
+      fetched.finalUrl,
+      directSpec.doc,
+    );
+
+    if (
+      hashOpenApiDocument(bundledDoc) === cachedHash &&
+      fetched.finalUrl === cached.discovery.documentUrl
+    ) {
+      await persistResolvedDocument(normalizedInput, cached);
+      return cached;
+    }
+
+    const resolved = buildResolvedDocument(
+      candidate,
+      fetched.finalUrl,
+      directSpec,
+      bundledDoc,
+      normalizedInput,
+    );
+    await persistResolvedDocument(normalizedInput, resolved);
+    return resolved;
+  }
+
+  if (looksLikeHtml(fetched.body, fetched.contentType)) {
+    const inlineSpec = extractInlineOpenApiDocument(fetched.body);
+    if (inlineSpec) {
+      if (
+        hashOpenApiDocument(inlineSpec.doc) === cachedHash &&
+        fetched.finalUrl === cached.discovery.documentUrl &&
+        cached.discovery.source === "inline-html"
+      ) {
+        await persistResolvedDocument(normalizedInput, cached);
+        return cached;
+      }
+
+      const resolved = buildResolvedDocument(
+        { ...candidate, source: "inline-html", pageUrl: fetched.finalUrl },
+        fetched.finalUrl,
+        inlineSpec,
+        inlineSpec.doc,
+        normalizedInput,
+      );
+      await persistResolvedDocument(normalizedInput, resolved);
+      return resolved;
+    }
+  }
+
+  throw new Error(
+    `Canonical OpenAPI document at ${cached.discovery.documentUrl} no longer contains a parseable spec.`,
+  );
+}
+
+function hashOpenApiDocument(doc: OpenApiDocument): string {
+  return createHash("sha256").update(JSON.stringify(doc)).digest("hex");
+}
+
+function shouldRevalidateCache(lastValidatedAt: number): boolean {
+  const revalidateMs = getCacheRevalidateMs();
+  if (revalidateMs === 0) {
+    return true;
+  }
+
+  return Date.now() - lastValidatedAt >= revalidateMs;
+}
+
+function getCacheRevalidateMs(): number {
+  const raw = process.env.MCP_OPENAPI_DISCOVERY_REVALIDATE_MS?.trim();
+  if (!raw) {
+    return DEFAULT_CACHE_REVALIDATE_MS;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_CACHE_REVALIDATE_MS;
+  }
+
+  return Math.min(parsed, CACHE_TTL_MS);
+}
+
+function parseCacheTimestamp(value: string | undefined): number {
+  const parsed = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 async function discoverOpenApiDocument(
@@ -2006,9 +2175,18 @@ function buildResolvedDocument(
 function hydrateResolvedDocument(
   normalizedInput: string,
   resolved: ResolvedDocument,
+  lastValidatedAt = Date.now(),
 ): void {
-  specCache.set(resolved.specId, resolved);
-  documentCache.set(normalizedInput, Promise.resolve(resolved));
+  specCache.set(resolved.specId, {
+    normalizedInput,
+    resolved,
+    lastValidatedAt,
+  });
+  documentCache.set(normalizedInput, {
+    promise: Promise.resolve(resolved),
+    lastValidatedAt,
+    pending: false,
+  });
 }
 
 async function readCachedDocumentByInput(

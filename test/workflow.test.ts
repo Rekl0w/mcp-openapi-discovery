@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   detectOpenApi,
+  listOpenApiEndpoints,
   searchOpenApiEndpoints,
   suggestCallSequence,
 } from "../src/openapi.js";
@@ -403,6 +404,95 @@ describe("workflow planning and persistent cache", () => {
     });
     expect(cachedSearch.endpoints[0]?.matchedTerms).toEqual(
       expect.arrayContaining(["add", "order"]),
+    );
+  });
+
+  it("revalidates discovered specs when the canonical document gains new endpoints", async () => {
+    const inputUrl = "https://fresh.example.com/api";
+    const documentUrl =
+      "https://fresh.example.com/request-docs/api?openapi=true";
+    let includeProjectPermissions = false;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+
+        if (url === inputUrl) {
+          return new Response("Not Found", { status: 404 });
+        }
+
+        if (url !== documentUrl) {
+          return new Response("Not Found", { status: 404 });
+        }
+
+        return jsonResponse({
+          openapi: "3.0.0",
+          info: {
+            title: "Fresh API",
+            version: "1.0.0",
+          },
+          paths: {
+            "/api/projects/getAll": {
+              get: {
+                summary: "List projects",
+                responses: {
+                  "200": {
+                    description: "OK",
+                  },
+                },
+              },
+            },
+            ...(includeProjectPermissions
+              ? {
+                  "/api/projects/getProjectPermissions": {
+                    get: {
+                      summary: "List project permissions",
+                      responses: {
+                        "200": {
+                          description: "OK",
+                        },
+                      },
+                    },
+                    head: {
+                      summary: "List project permissions",
+                      responses: {
+                        "200": {
+                          description: "OK",
+                        },
+                      },
+                    },
+                  },
+                }
+              : {}),
+          },
+        });
+      }),
+    );
+
+    const initialSummary = await detectOpenApi(inputUrl);
+    expect(initialSummary.endpointCount).toBe(1);
+
+    includeProjectPermissions = true;
+
+    const refreshed = await listOpenApiEndpoints(inputUrl, { limit: 10 });
+    expect(refreshed.totalEndpoints).toBe(3);
+    expect(refreshed.endpoints).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          method: "GET",
+          path: "/api/projects/getProjectPermissions",
+        }),
+        expect.objectContaining({
+          method: "HEAD",
+          path: "/api/projects/getProjectPermissions",
+        }),
+      ]),
     );
   });
 
