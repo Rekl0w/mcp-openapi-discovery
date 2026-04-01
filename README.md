@@ -13,6 +13,11 @@ Published package:
 
 - npm: [@rekl0w/mcp-openapi-discovery](https://www.npmjs.com/package/@rekl0w/mcp-openapi-discovery)
 
+Release resources:
+
+- GitHub Releases: [Rekl0w/mcp-openapi-discovery releases](https://github.com/Rekl0w/mcp-openapi-discovery/releases)
+- Upcoming `v0.3.2` notes: [`releases/v0.3.2.md`](releases/v0.3.2.md)
+
 ## Why this project exists
 
 Many APIs expose documentation pages, but not always the raw spec URL directly. This server helps bridge that gap by discovering the OpenAPI document behind a docs page and turning it into callable MCP tools.

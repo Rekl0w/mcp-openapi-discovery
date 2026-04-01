@@ -92,7 +92,7 @@ const ACCEPT_HEADER = [
   "text/html;q=0.9",
 ].join(", ");
 
-const USER_AGENT = "mcp-openapi-discovery/0.3.1";
+const USER_AGENT = "mcp-openapi-discovery/0.3.2";
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_CANDIDATES = 30;
 const MAX_SCHEMA_PROPERTIES = 12;
