@@ -1,6 +1,7 @@
 import {
   getOpenApiEndpointExecutionContext,
   type EndpointExecutionContext,
+  type ParameterSummary,
   type SecuritySchemeSummary,
 } from "./openapi.js";
 
@@ -24,6 +25,11 @@ const SENSITIVE_FIELD_PATTERN =
   /password|secret|token|authorization|api[-_]?key|client_secret/i;
 
 type JsonObject = Record<string, unknown>;
+export type EndpointQueryInput =
+  | Record<string, unknown>
+  | string
+  | URLSearchParams
+  | Array<[string, unknown]>;
 
 export interface EndpointAuthInput {
   strategy?:
@@ -53,7 +59,7 @@ export interface CallEndpointInput {
   method: string;
   path: string;
   pathParams?: Record<string, unknown>;
-  query?: Record<string, unknown>;
+  query?: EndpointQueryInput;
   headers?: Record<string, unknown>;
   body?: unknown;
   rawBody?: string;
@@ -119,16 +125,25 @@ interface AccessTokenResult {
 export async function callOpenApiEndpoint(
   input: CallEndpointInput,
 ): Promise<CallEndpointResult> {
+  const parsedPath = parseEndpointPathInput(input.path);
   const context = await getOpenApiEndpointExecutionContext(
     input.url,
     input.method,
-    input.path,
+    parsedPath.path,
   );
   const pathParams = input.pathParams ?? {};
-  const queryInput = input.query ?? {};
-  const resolvedPath = resolvePathTemplate(input.path, pathParams);
+  const resolvedPath = resolvePathTemplate(parsedPath.path, pathParams);
+  const embeddedQuery = resolveQueryTemplates(parsedPath.query, pathParams);
   const requestBaseUrl = resolveRequestBaseUrl(context);
-  const requestUrl = buildRequestUrl(requestBaseUrl, resolvedPath, queryInput);
+  const requestUrl = buildRequestUrl({
+    baseUrl: requestBaseUrl,
+    resolvedPath,
+    embeddedQuery,
+    query: input.query,
+    queryParameters: context.endpoint.parameters.filter(
+      (parameter) => parameter.in === "query",
+    ),
+  });
   const headers = normalizeHeaders(input.headers);
   const state: MutableRequestState = {
     headers,
@@ -139,6 +154,7 @@ export async function callOpenApiEndpoint(
   };
 
   await resolveAuthentication(context, input.auth, state);
+  syncRequestUrlQuery(requestUrl, state);
 
   const bodyPreparation = prepareRequestBody({
     body: input.body,
@@ -185,7 +201,7 @@ export async function callOpenApiEndpoint(
       method: input.method.toUpperCase(),
       headers: maskHeaders(state.headers, state.sensitiveHeaderNames),
       contentType: bodyPreparation.contentType,
-      query: sanitizeForOutput(queryInput) as Record<string, unknown>,
+      query: sanitizeQueryForOutput(state.query, state.sensitiveQueryKeys),
       pathParams: sanitizeForOutput(pathParams) as Record<string, unknown>,
       bodyPreview: bodyPreparation.preview,
       auth: {
@@ -890,16 +906,17 @@ function resolvePathTemplate(
   });
 }
 
-function buildRequestUrl(
-  baseUrl: string,
-  resolvedPath: string,
-  query: Record<string, unknown>,
-): URL {
-  const url = new URL(baseUrl);
+function buildRequestUrl(input: {
+  baseUrl: string;
+  resolvedPath: string;
+  embeddedQuery: URLSearchParams;
+  query: EndpointQueryInput | undefined;
+  queryParameters: ParameterSummary[];
+}): URL {
+  const url = new URL(input.baseUrl);
   const basePath = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
-  const normalizedResolvedPath = resolvedPath.startsWith("/")
-    ? resolvedPath
-    : `/${resolvedPath}`;
+  const parsedResolvedPath = parseEndpointPathInput(input.resolvedPath);
+  const normalizedResolvedPath = parsedResolvedPath.path;
   const finalPath =
     basePath && normalizedResolvedPath === basePath
       ? basePath
@@ -909,8 +926,81 @@ function buildRequestUrl(
   url.pathname = finalPath || "/";
   url.search = "";
   url.hash = "";
-  appendQueryValues(url.searchParams, query);
+  appendSearchParams(url.searchParams, input.embeddedQuery);
+  appendSearchParams(url.searchParams, parsedResolvedPath.query);
+  appendQueryValues(url.searchParams, input.query, input.queryParameters);
   return url;
+}
+
+function parseEndpointPathInput(path: string): {
+  path: string;
+  query: URLSearchParams;
+} {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    throw new Error("Endpoint path is required.");
+  }
+
+  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(trimmed)) {
+    const url = new URL(trimmed);
+    return {
+      path: safeDecodePathname(url.pathname || "/"),
+      query: new URLSearchParams(url.search),
+    };
+  }
+
+  const withoutHash = trimmed.split("#", 1)[0] ?? "";
+  const queryIndex = withoutHash.indexOf("?");
+  const pathOnly =
+    queryIndex >= 0 ? withoutHash.slice(0, queryIndex) : withoutHash;
+  const queryString = queryIndex >= 0 ? withoutHash.slice(queryIndex + 1) : "";
+  const normalizedPath = pathOnly || "/";
+
+  return {
+    path: normalizedPath.startsWith("/")
+      ? normalizedPath
+      : `/${normalizedPath}`,
+    query: new URLSearchParams(queryString),
+  };
+}
+
+function syncRequestUrlQuery(url: URL, state: MutableRequestState): void {
+  url.search = state.query.toString();
+  state.query = url.searchParams;
+}
+
+function safeDecodePathname(pathname: string): string {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
+
+function resolveQueryTemplates(
+  query: URLSearchParams,
+  pathParams: Record<string, unknown>,
+): URLSearchParams {
+  const resolved = new URLSearchParams();
+  query.forEach((value, key) => {
+    resolved.append(
+      resolveTemplateString(key, pathParams),
+      resolveTemplateString(value, pathParams),
+    );
+  });
+  return resolved;
+}
+
+function resolveTemplateString(
+  value: string,
+  pathParams: Record<string, unknown>,
+): string {
+  return value.replace(/\{([^}]+)\}/g, (_fullMatch, key: string) => {
+    if (!(key in pathParams)) {
+      throw new Error(`Missing required path parameter: ${key}`);
+    }
+    return String(pathParams[key]);
+  });
 }
 
 function resolveRequestBaseUrl(context: EndpointExecutionContext): string {
@@ -996,29 +1086,230 @@ function normalizeHostname(hostname: string): string {
 
 function appendQueryValues(
   target: URLSearchParams,
-  value: Record<string, unknown>,
+  value: EndpointQueryInput | undefined,
+  parameters: ParameterSummary[] = [],
 ): void {
-  for (const [key, rawValue] of Object.entries(value ?? {})) {
-    if (rawValue === undefined || rawValue === null) {
-      continue;
-    }
-
-    if (Array.isArray(rawValue)) {
-      for (const item of rawValue) {
-        if (item !== undefined && item !== null) {
-          target.append(key, String(item));
-        }
-      }
-      continue;
-    }
-
-    if (typeof rawValue === "object") {
-      target.append(key, JSON.stringify(rawValue));
-      continue;
-    }
-
-    target.append(key, String(rawValue));
+  if (value === undefined || value === null) {
+    return;
   }
+
+  if (typeof value === "string") {
+    appendSearchParams(
+      target,
+      new URLSearchParams(value.trim().replace(/^\?/, "")),
+    );
+    return;
+  }
+
+  if (value instanceof URLSearchParams) {
+    appendSearchParams(target, value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const [key, rawValue] of value) {
+      appendQueryEntry(
+        target,
+        key,
+        rawValue,
+        findQueryParameter(parameters, key),
+      );
+    }
+    return;
+  }
+
+  for (const [key, rawValue] of Object.entries(value)) {
+    appendQueryEntry(
+      target,
+      key,
+      rawValue,
+      findQueryParameter(parameters, key),
+    );
+  }
+}
+
+function appendSearchParams(
+  target: URLSearchParams,
+  source: URLSearchParams,
+): void {
+  source.forEach((value, key) => {
+    target.append(key, value);
+  });
+}
+
+function findQueryParameter(
+  parameters: ParameterSummary[],
+  key: string,
+): ParameterSummary | undefined {
+  const normalizedKey = key.toLowerCase();
+  return parameters.find(
+    (parameter) => parameter.name.toLowerCase() === normalizedKey,
+  );
+}
+
+function appendQueryEntry(
+  target: URLSearchParams,
+  key: string,
+  rawValue: unknown,
+  parameter: ParameterSummary | undefined,
+): void {
+  if (rawValue === undefined || rawValue === null) {
+    return;
+  }
+
+  if (Array.isArray(rawValue)) {
+    appendArrayQueryValue(target, key, rawValue, parameter);
+    return;
+  }
+
+  if (isPlainObject(rawValue)) {
+    appendObjectQueryValue(target, key, rawValue, parameter);
+    return;
+  }
+
+  target.append(key, String(rawValue));
+}
+
+function appendArrayQueryValue(
+  target: URLSearchParams,
+  key: string,
+  values: unknown[],
+  parameter: ParameterSummary | undefined,
+): void {
+  const items = values
+    .filter((item) => item !== undefined && item !== null)
+    .map(stringifyQueryPrimitive);
+
+  if (items.length === 0) {
+    return;
+  }
+
+  switch (parameter?.collectionFormat) {
+    case "csv":
+      target.append(key, items.join(","));
+      return;
+    case "ssv":
+      target.append(key, items.join(" "));
+      return;
+    case "tsv":
+      target.append(key, items.join("\t"));
+      return;
+    case "pipes":
+      target.append(key, items.join("|"));
+      return;
+    case "multi":
+      appendRepeatedQueryValues(target, key, items);
+      return;
+  }
+
+  const style = parameter?.style ?? "form";
+  const explode = parameter?.explode ?? style === "form";
+
+  if (style === "spaceDelimited") {
+    target.append(key, items.join(" "));
+    return;
+  }
+
+  if (style === "pipeDelimited") {
+    target.append(key, items.join("|"));
+    return;
+  }
+
+  if (style === "form" && !explode) {
+    target.append(key, items.join(","));
+    return;
+  }
+
+  appendRepeatedQueryValues(target, key, items);
+}
+
+function appendObjectQueryValue(
+  target: URLSearchParams,
+  key: string,
+  value: JsonObject,
+  parameter: ParameterSummary | undefined,
+): void {
+  if (!parameter) {
+    target.append(key, JSON.stringify(value));
+    return;
+  }
+
+  const entries = Object.entries(value).filter(
+    ([, item]) => item !== undefined && item !== null,
+  );
+  if (entries.length === 0) {
+    return;
+  }
+
+  const style = parameter.style ?? "form";
+  const explode = parameter.explode ?? style === "form";
+
+  if (style === "deepObject") {
+    for (const [propertyKey, propertyValue] of entries) {
+      appendQueryEntry(
+        target,
+        `${key}[${propertyKey}]`,
+        propertyValue,
+        undefined,
+      );
+    }
+    return;
+  }
+
+  if (style === "form" && explode) {
+    for (const [propertyKey, propertyValue] of entries) {
+      appendQueryEntry(target, propertyKey, propertyValue, undefined);
+    }
+    return;
+  }
+
+  if (style === "form" && !explode) {
+    target.append(
+      key,
+      entries
+        .flatMap(([propertyKey, propertyValue]) => [
+          propertyKey,
+          stringifyQueryPrimitive(propertyValue),
+        ])
+        .join(","),
+    );
+    return;
+  }
+
+  target.append(key, JSON.stringify(value));
+}
+
+function appendRepeatedQueryValues(
+  target: URLSearchParams,
+  key: string,
+  values: string[],
+): void {
+  for (const item of values) {
+    target.append(key, item);
+  }
+}
+
+function stringifyQueryPrimitive(value: unknown): string {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (isPlainObject(value) || Array.isArray(value)) {
+    return JSON.stringify(value);
+  }
+
+  return String(value);
+}
+
+function isPlainObject(value: unknown): value is JsonObject {
+  return (
+    Boolean(value) &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    !(value instanceof URLSearchParams) &&
+    !(value instanceof Date) &&
+    !(value instanceof Blob)
+  );
 }
 
 function appendFormData(
@@ -1132,6 +1423,38 @@ function maskUrl(url: URL, sensitiveQueryKeys: Set<string>): string {
     }
   }
   return masked.toString();
+}
+
+function sanitizeQueryForOutput(
+  query: URLSearchParams,
+  sensitiveQueryKeys: Set<string>,
+): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+
+  query.forEach((value, key) => {
+    const normalizedKey = key.toLowerCase();
+    const safeValue =
+      sensitiveQueryKeys.has(normalizedKey) ||
+      SENSITIVE_QUERY_KEYS.includes(normalizedKey) ||
+      SENSITIVE_FIELD_PATTERN.test(key)
+        ? "***"
+        : sanitizeForOutput(value);
+
+    const existing = output[key];
+    if (existing === undefined) {
+      output[key] = safeValue;
+      return;
+    }
+
+    if (Array.isArray(existing)) {
+      existing.push(safeValue);
+      return;
+    }
+
+    output[key] = [existing, safeValue];
+  });
+
+  return output;
 }
 
 function sanitizeForOutput(value: unknown): unknown {

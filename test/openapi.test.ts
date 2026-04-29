@@ -472,6 +472,56 @@ describe("openapi discovery", () => {
     });
   });
 
+  it("looks up endpoint details when the input path includes a query string", async () => {
+    const specUrl = "https://reports.example.com/openapi.json";
+    installFetchMock({
+      [specUrl]: jsonResponse(
+        {
+          openapi: "3.1.0",
+          info: {
+            title: "Reports API",
+            version: "1.0.0",
+          },
+          paths: {
+            "/reports": {
+              get: {
+                summary: "List reports",
+                parameters: [
+                  {
+                    name: "period",
+                    in: "query",
+                    required: false,
+                    schema: { type: "string" },
+                  },
+                ],
+                responses: {
+                  "200": { description: "OK" },
+                },
+              },
+            },
+          },
+        },
+        specUrl,
+      ),
+    });
+
+    const result = await getOpenApiEndpointDetails(
+      specUrl,
+      "GET",
+      "/reports?period=monthly",
+    );
+
+    expect(result.endpoint).toMatchObject({
+      method: "GET",
+      path: "/reports",
+      summary: "List reports",
+    });
+    expect(result.endpoint.parameters[0]).toMatchObject({
+      name: "period",
+      in: "query",
+    });
+  });
+
   it("searches endpoints from cached server-side index using specId", async () => {
     const specUrl = "https://shop.example.com/openapi.json";
     installFetchMock({

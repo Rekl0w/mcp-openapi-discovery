@@ -369,9 +369,11 @@ export function createServer(): McpServer {
           .optional()
           .describe('Path template values, e.g. {"id":"42"}'),
         query: z
-          .record(z.string(), z.unknown())
+          .union([z.record(z.string(), z.unknown()), z.string()])
           .optional()
-          .describe("Query string parameters"),
+          .describe(
+            'Query string parameters as an object or raw string, e.g. {"page":2} or "page=2&sort=name"',
+          ),
         headers: z
           .record(z.string(), z.unknown())
           .optional()

@@ -183,6 +183,10 @@ export interface ParameterSummary {
   required: boolean;
   description?: string;
   deprecated?: boolean;
+  style?: string;
+  explode?: boolean;
+  allowReserved?: boolean;
+  collectionFormat?: string;
   schema?: SchemaDescriptor;
 }
 
@@ -652,10 +656,13 @@ export async function suggestCallSequence(input: {
       );
     }
 
+    const normalizedTargetPath = normalizeOperationPathInput(input.targetPath);
+
     const target = resolved.endpoints.find(
       (endpoint) =>
         endpoint.method === normalizedMethod &&
-        endpoint.path === input.targetPath,
+        (endpoint.path === input.targetPath ||
+          normalizeOperationPathInput(endpoint.path) === normalizedTargetPath),
     );
 
     if (!target) {
@@ -782,6 +789,9 @@ export async function traceParameterUsage(
   const matches: ParameterUsageMatch[] = [];
   const includeRequestBodies = options.includeRequestBodies ?? true;
   const includeResponseBodies = options.includeResponseBodies ?? true;
+  const normalizedFilterPath = options.path
+    ? normalizeOperationPathInput(options.path)
+    : undefined;
   const searchNeedles = buildParameterNeedles(
     parameterName,
     options.entityName,
@@ -795,7 +805,11 @@ export async function traceParameterUsage(
       continue;
     }
 
-    if (options.path && path !== options.path) {
+    if (
+      normalizedFilterPath &&
+      path !== options.path &&
+      normalizeOperationPathInput(path) !== normalizedFilterPath
+    ) {
       continue;
     }
 
@@ -3975,7 +3989,13 @@ function getOperationContext(
   | undefined {
   const normalizedMethod = method.toLowerCase() as HttpMethod;
   const paths = isObject(doc.paths) ? doc.paths : {};
-  const pathItem = paths[path];
+  const pathEntry = findPathEntry(paths, path);
+
+  if (!pathEntry) {
+    return undefined;
+  }
+
+  const [matchedPath, pathItem] = pathEntry;
 
   if (!isObject(pathItem)) {
     return undefined;
@@ -3991,7 +4011,7 @@ function getOperationContext(
   return {
     endpoint: {
       method,
-      path,
+      path: matchedPath,
       operationId:
         typeof operation.operationId === "string"
           ? operation.operationId
@@ -4015,6 +4035,21 @@ function getOperationContext(
     securityRequirements,
     securitySchemes: summarizeSecuritySchemes(doc, securityRequirements),
   };
+}
+
+function findPathEntry(
+  paths: Record<string, unknown>,
+  path: string,
+): [string, unknown] | undefined {
+  if (path in paths) {
+    return [path, paths[path]];
+  }
+
+  const normalizedPath = normalizeOperationPathInput(path);
+  return Object.entries(paths).find(
+    ([candidatePath]) =>
+      normalizeOperationPathInput(candidatePath) === normalizedPath,
+  );
 }
 
 function summarizeParameters(
@@ -4046,6 +4081,17 @@ function summarizeParameters(
           ? resolved.description
           : undefined,
       deprecated: resolved.deprecated === true,
+      style: typeof resolved.style === "string" ? resolved.style : undefined,
+      explode:
+        typeof resolved.explode === "boolean" ? resolved.explode : undefined,
+      allowReserved:
+        typeof resolved.allowReserved === "boolean"
+          ? resolved.allowReserved
+          : undefined,
+      collectionFormat:
+        typeof resolved.collectionFormat === "string"
+          ? resolved.collectionFormat
+          : undefined,
       schema: summarizeSchema(doc, readSchemaFromParameter(resolved)),
     });
   }
@@ -4566,6 +4612,37 @@ function normalizeUserUrl(rawUrl: string): URL {
 
   url.hash = "";
   return url;
+}
+
+function normalizeOperationPathInput(path: string): string {
+  const trimmed = path.trim();
+  if (!trimmed) {
+    return "/";
+  }
+
+  if (/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      return safeDecodePathname(url.pathname || "/");
+    } catch {
+      return trimmed;
+    }
+  }
+
+  const withoutHash = trimmed.split("#", 1)[0] ?? "";
+  const queryIndex = withoutHash.indexOf("?");
+  const pathOnly =
+    queryIndex >= 0 ? withoutHash.slice(0, queryIndex) : withoutHash;
+  const normalized = pathOnly || "/";
+  return normalized.startsWith("/") ? normalized : `/${normalized}`;
+}
+
+function safeDecodePathname(pathname: string): string {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
 }
 
 function normalizeMethod(
