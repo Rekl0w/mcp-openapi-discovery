@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stringify } from "yaml";
 import {
@@ -45,12 +48,21 @@ function yamlResponse(data: unknown): Response {
 }
 
 describe("openapi discovery", () => {
-  beforeEach(() => {
+  let cacheDir = "";
+
+  beforeEach(async () => {
     vi.restoreAllMocks();
+    cacheDir = await mkdtemp(join(tmpdir(), "mcp-openapi-discovery-openapi-"));
+    process.env.MCP_OPENAPI_DISCOVERY_CACHE_DIR = cacheDir;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.unstubAllGlobals();
+    delete process.env.MCP_OPENAPI_DISCOVERY_CACHE_DIR;
+    if (cacheDir) {
+      await rm(cacheDir, { recursive: true, force: true });
+      cacheDir = "";
+    }
   });
 
   it("discovers an OpenAPI document from an HTML docs page", async () => {
