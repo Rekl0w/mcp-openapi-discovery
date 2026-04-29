@@ -2291,11 +2291,14 @@ function buildInitialCandidates(inputUrl: URL): CandidateUrl[] {
     candidates.push({ url, source, trail });
   };
 
-  add(inputUrl.toString(), "direct", [`direct: ${inputUrl.toString()}`]);
-
   const root = new URL("/", inputUrl);
   const currentDir = new URL("./", inputUrl);
   const pageDir = getPageDirectoryUrl(inputUrl);
+
+  add(inputUrl.toString(), "direct", [`direct: ${inputUrl.toString()}`]);
+  add(root.toString(), "common-path", [
+    `origin root fallback: ${root.toString()}`,
+  ]);
 
   for (const path of HIGH_SIGNAL_SPEC_PATHS) {
     add(new URL(path, pageDir).toString(), "common-path", [

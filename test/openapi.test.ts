@@ -196,6 +196,75 @@ describe("openapi discovery", () => {
     expect(summary.apiTitle).toBe("Sibling Docs API");
   });
 
+  it("falls back from an endpoint URL to the origin root docs page", async () => {
+    const endpointUrl = "https://app.example.com/api/users/42";
+    const rootUrl = "https://app.example.com/";
+    const specUrl = "https://app.example.com/openapi.json";
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+
+      if (url === endpointUrl) {
+        return new Response("Not Found", { status: 404 });
+      }
+
+      if (url === rootUrl) {
+        return new Response(
+          '<html><body><redoc spec-url="/openapi.json"></redoc></body></html>',
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/html",
+            },
+          },
+        );
+      }
+
+      if (url === specUrl) {
+        return jsonResponse(
+          {
+            openapi: "3.1.0",
+            info: {
+              title: "Root Docs API",
+              version: "1.0.0",
+            },
+            paths: {
+              "/api/users/{id}": {
+                get: {
+                  summary: "Get user",
+                  responses: {
+                    "200": { description: "OK" },
+                  },
+                },
+              },
+            },
+          },
+          specUrl,
+        );
+      }
+
+      return new Response(`Unexpected URL: ${url}`, { status: 404 });
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const summary = await detectOpenApi(endpointUrl);
+
+    expect(summary.inputUrl).toBe(endpointUrl);
+    expect(summary.documentUrl).toBe(specUrl);
+    expect(summary.apiTitle).toBe("Root Docs API");
+    expect(summary.discoveryTrail).toEqual(
+      expect.arrayContaining([`origin root fallback: ${rootUrl}`]),
+    );
+    expect(
+      fetchMock.mock.calls.slice(0, 2).map((call) => String(call[0])),
+    ).toEqual([endpointUrl, rootUrl]);
+  });
+
   it("discovers a versioned v3 OpenAPI path from a docs shell page", async () => {
     const docsUrl = "https://petstore.example.com/docs";
     const specUrl = "https://petstore.example.com/api/v3/openapi.json";
