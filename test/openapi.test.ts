@@ -166,6 +166,82 @@ describe("openapi discovery", () => {
     expect(summary.endpointCount).toBe(1);
   });
 
+  it("sends basic auth while discovering protected Laravel Request Docs specs", async () => {
+    const docsUrl = "https://secure.example.com/request-docs";
+    const specUrl = "https://secure.example.com/request-docs/api?openapi=true";
+    const expectedAuthorization = `Basic ${Buffer.from(
+      "demo:secret",
+    ).toString("base64")}`;
+    const seenAuthorization = new Map<string, string | null>();
+    const spec = {
+      openapi: "3.0.0",
+      info: {
+        title: "Protected Request Docs",
+        version: "1.0.0",
+      },
+      paths: {
+        "/api/me": {
+          get: {
+            summary: "Current user",
+            responses: {
+              "200": { description: "OK" },
+            },
+          },
+        },
+      },
+    };
+    const fetchMock = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+        const headers = new Headers(
+          input instanceof Request ? input.headers : init?.headers,
+        );
+        seenAuthorization.set(url, headers.get("authorization"));
+
+        if (headers.get("authorization") !== expectedAuthorization) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+
+        if (url === docsUrl) {
+          return new Response(
+            "<!DOCTYPE html><html><head><title>LRD</title></head><body><div id='app'></div></body></html>",
+            {
+              status: 200,
+              headers: {
+                "content-type": "text/html",
+              },
+            },
+          );
+        }
+
+        if (url === specUrl) {
+          return jsonResponse(spec, specUrl);
+        }
+
+        return new Response("Not Found", { status: 404 });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const summary = await detectOpenApi(docsUrl, {
+      auth: {
+        strategy: "basic",
+        username: "demo",
+        password: "secret",
+      },
+    });
+
+    expect(summary.documentUrl).toBe(specUrl);
+    expect(summary.apiTitle).toBe("Protected Request Docs");
+    expect(seenAuthorization.get(docsUrl)).toBe(expectedAuthorization);
+    expect(seenAuthorization.get(specUrl)).toBe(expectedAuthorization);
+  });
+
   it("discovers a Laravel Request Docs spec from a sibling /api input", async () => {
     const apiInputUrl = "https://docs.example.com/api";
     const docsUrl = "https://docs.example.com/request-docs";

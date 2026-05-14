@@ -32,6 +32,7 @@ It is especially useful for:
 ## Features
 
 - Detect OpenAPI / Swagger specs from docs pages or direct spec URLs
+- Detect protected docs/spec pages by sending Basic auth, Bearer tokens, API keys, or custom discovery headers
 - Assign a stable in-memory `specId` for each detected spec so later tools can work without re-exposing the full document
 - Persist discovered specs on disk so `specId`-based tools can survive process restarts
 - Summarize API metadata, servers, tags, and endpoint counts
@@ -261,6 +262,21 @@ Use `trace_parameter_usage` when you want to follow a field such as `userId` acr
 Use `find_related_endpoints` when you already know one endpoint and want to discover nearby or dependent endpoints, such as child resources or endpoints using the same identifiers.
 
 ## Endpoint execution and authentication
+
+Discovery tools that accept a `url` also accept an optional `auth` object. Use this when the docs page or spec URL itself is protected, for example a Laravel Request Docs page behind HTTP Basic auth.
+
+```json
+{
+  "url": "https://api.example.com/request-docs",
+  "auth": {
+    "strategy": "basic",
+    "username": "demo",
+    "password": "super-secret"
+  }
+}
+```
+
+Discovery auth is sent only to the same origin as the input URL, including common fallback paths such as `request-docs/api?openapi=true` and same-origin remote `$ref` files.
 
 The `call_endpoint` tool can execute actual API calls, not just describe them.
 

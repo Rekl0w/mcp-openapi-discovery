@@ -1,6 +1,7 @@
 import {
   getOpenApiEndpointExecutionContext,
   type EndpointExecutionContext,
+  type OpenApiAuthInput,
   type ParameterSummary,
   type SecuritySchemeSummary,
 } from "./openapi.js";
@@ -31,7 +32,7 @@ export type EndpointQueryInput =
   | URLSearchParams
   | Array<[string, unknown]>;
 
-export interface EndpointAuthInput {
+export interface EndpointAuthInput extends OpenApiAuthInput {
   strategy?:
     | "auto"
     | "none"
@@ -45,6 +46,7 @@ export interface EndpointAuthInput {
   token?: string;
   apiKey?: string;
   apiKeyName?: string;
+  headers?: Record<string, unknown>;
   clientId?: string;
   clientSecret?: string;
   scopes?: string[];
@@ -130,6 +132,7 @@ export async function callOpenApiEndpoint(
     input.url,
     input.method,
     parsedPath.path,
+    { auth: input.auth },
   );
   const pathParams = input.pathParams ?? {};
   const resolvedPath = resolvePathTemplate(parsedPath.path, pathParams);

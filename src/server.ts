@@ -38,11 +38,33 @@ function createErrorResult(message: string): CallToolResult {
   };
 }
 
+const discoveryAuthInputSchema = z
+  .object({
+    strategy: z
+      .enum(["auto", "none", "basic", "bearer", "apiKey"])
+      .optional()
+      .describe("How auth should be applied while fetching docs/specs"),
+    username: z.string().optional().describe("Username for Basic auth"),
+    password: z.string().optional().describe("Password for Basic auth"),
+    token: z.string().optional().describe("Bearer token"),
+    apiKey: z.string().optional().describe("API key value"),
+    apiKeyName: z
+      .string()
+      .optional()
+      .describe("API key header name; defaults to X-API-Key"),
+    headers: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe("Extra headers to send while fetching protected docs/specs"),
+  })
+  .optional()
+  .describe("Authentication for protected docs or OpenAPI documents");
+
 export function createServer(): McpServer {
   const server = new McpServer(
     {
       name: "mcp-openapi-discovery",
-      version: "0.4.0",
+      version: "0.5.0",
     },
     {
       capabilities: {
@@ -60,11 +82,12 @@ export function createServer(): McpServer {
         url: z
           .string()
           .describe("Docs page URL or direct OpenAPI JSON/YAML URL"),
+        auth: discoveryAuthInputSchema,
       },
     },
-    async ({ url }) => {
+    async ({ url, auth }) => {
       try {
-        const summary = await detectOpenApi(url);
+        const summary = await detectOpenApi(url, { auth });
         return {
           content: [
             {
@@ -91,6 +114,7 @@ export function createServer(): McpServer {
         url: z
           .string()
           .describe("Docs page URL or direct OpenAPI JSON/YAML URL"),
+        auth: discoveryAuthInputSchema,
         tag: z.string().optional().describe("Optional tag filter, e.g. users"),
         method: z
           .enum([
@@ -122,9 +146,18 @@ export function createServer(): McpServer {
           .describe("Maximum endpoint count to return; defaults to 50"),
       },
     },
-    async ({ url, tag, method, pathContains, includeDeprecated, limit }) => {
+    async ({
+      url,
+      auth,
+      tag,
+      method,
+      pathContains,
+      includeDeprecated,
+      limit,
+    }) => {
       try {
         const result = await listOpenApiEndpoints(url, {
+          auth,
           tag,
           method,
           pathContains,
@@ -307,6 +340,7 @@ export function createServer(): McpServer {
         url: z
           .string()
           .describe("Docs page URL or direct OpenAPI JSON/YAML URL"),
+        auth: discoveryAuthInputSchema,
         method: z
           .enum([
             "GET",
@@ -322,9 +356,11 @@ export function createServer(): McpServer {
         path: z.string().describe("Exact OpenAPI path, e.g. /api/users/{id}"),
       },
     },
-    async ({ url, method, path }) => {
+    async ({ url, auth, method, path }) => {
       try {
-        const result = await getOpenApiEndpointDetails(url, method, path);
+        const result = await getOpenApiEndpointDetails(url, method, path, {
+          auth,
+        });
         return {
           content: [
             {
@@ -448,6 +484,12 @@ export function createServer(): McpServer {
               .record(z.string(), z.unknown())
               .optional()
               .describe("Extra headers for token acquisition request"),
+            headers: z
+              .record(z.string(), z.unknown())
+              .optional()
+              .describe(
+                "Extra headers to send while fetching protected docs/specs",
+              ),
             extraTokenParams: z
               .record(z.string(), z.unknown())
               .optional()
@@ -511,6 +553,7 @@ export function createServer(): McpServer {
         url: z
           .string()
           .describe("Docs page URL or direct OpenAPI JSON/YAML URL"),
+        auth: discoveryAuthInputSchema,
         parameterName: z
           .string()
           .describe("Parameter or field name to trace, e.g. userId"),
@@ -551,6 +594,7 @@ export function createServer(): McpServer {
     },
     async ({
       url,
+      auth,
       parameterName,
       entityName,
       method,
@@ -567,6 +611,7 @@ export function createServer(): McpServer {
           includeRequestBodies,
           includeResponseBodies,
           limit,
+          auth,
         });
 
         return {
@@ -595,6 +640,7 @@ export function createServer(): McpServer {
         url: z
           .string()
           .describe("Docs page URL or direct OpenAPI JSON/YAML URL"),
+        auth: discoveryAuthInputSchema,
         method: z
           .enum([
             "GET",
@@ -617,9 +663,12 @@ export function createServer(): McpServer {
           .describe("Maximum number of related endpoints to return"),
       },
     },
-    async ({ url, method, path, limit }) => {
+    async ({ url, auth, method, path, limit }) => {
       try {
-        const result = await findRelatedEndpoints(url, method, path, { limit });
+        const result = await findRelatedEndpoints(url, method, path, {
+          auth,
+          limit,
+        });
         return {
           content: [
             {

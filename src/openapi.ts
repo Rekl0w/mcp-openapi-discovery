@@ -92,7 +92,7 @@ const ACCEPT_HEADER = [
   "text/html;q=0.9",
 ].join(", ");
 
-const USER_AGENT = "mcp-openapi-discovery/0.4.0";
+const USER_AGENT = "mcp-openapi-discovery/0.5.0";
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_CANDIDATES = 30;
 const MAX_SCHEMA_PROPERTIES = 12;
@@ -154,6 +154,29 @@ export interface DiscoverySummary {
   tags: string[];
   endpointCount: number;
   discoveryTrail: string[];
+}
+
+export type OpenApiAuthStrategy =
+  | "auto"
+  | "none"
+  | "basic"
+  | "bearer"
+  | "apiKey"
+  | "oauth2-password"
+  | "oauth2-client-credentials";
+
+export interface OpenApiAuthInput {
+  strategy?: OpenApiAuthStrategy;
+  username?: string;
+  password?: string;
+  token?: string;
+  apiKey?: string;
+  apiKeyName?: string;
+  headers?: Record<string, unknown>;
+}
+
+export interface OpenApiDiscoveryOptions {
+  auth?: OpenApiAuthInput;
 }
 
 export interface SchemaDescriptor {
@@ -410,6 +433,7 @@ interface CachedDocumentRecord {
   schemaVersion: number;
   cachedAt: string;
   normalizedInput: string;
+  cacheKey?: string;
   resolved: ResolvedDocument;
 }
 
@@ -421,8 +445,15 @@ interface DocumentCacheEntry {
 
 interface SpecCacheEntry {
   normalizedInput: string;
+  cacheKey: string;
   resolved: ResolvedDocument;
   lastValidatedAt: number;
+}
+
+interface DiscoveryFetchContext {
+  inputOrigin: string;
+  auth?: OpenApiAuthInput;
+  authFingerprint?: string;
 }
 
 type OpenApiDocument = JsonObject & {
@@ -440,8 +471,11 @@ type OpenApiDocument = JsonObject & {
 const documentCache = new Map<string, DocumentCacheEntry>();
 const specCache = new Map<string, SpecCacheEntry>();
 
-export async function detectOpenApi(url: string): Promise<DiscoverySummary> {
-  const resolved = await loadResolvedDocument(url);
+export async function detectOpenApi(
+  url: string,
+  options: OpenApiDiscoveryOptions = {},
+): Promise<DiscoverySummary> {
+  const resolved = await loadResolvedDocument(url, options);
   return resolved.discovery;
 }
 
@@ -453,6 +487,7 @@ export async function listOpenApiEndpoints(
     pathContains?: string;
     includeDeprecated?: boolean;
     limit?: number;
+    auth?: OpenApiAuthInput;
   } = {},
 ): Promise<{
   discovery: DiscoverySummary;
@@ -460,7 +495,7 @@ export async function listOpenApiEndpoints(
   matchedEndpoints: number;
   endpoints: EndpointSummary[];
 }> {
-  const resolved = await loadResolvedDocument(url);
+  const resolved = await loadResolvedDocument(url, { auth: filters.auth });
   const endpoints = resolved.endpoints;
   const normalizedMethod = normalizeMethod(filters.method);
   const tagFilter = filters.tag?.trim().toLowerCase();
@@ -702,11 +737,12 @@ export async function getOpenApiEndpointDetails(
   url: string,
   method: string,
   path: string,
+  options: OpenApiDiscoveryOptions = {},
 ): Promise<{
   discovery: DiscoverySummary;
   endpoint: EndpointDetail;
 }> {
-  const resolved = await loadResolvedDocument(url);
+  const resolved = await loadResolvedDocument(url, options);
   const normalizedMethod = normalizeMethod(method);
 
   if (!normalizedMethod) {
@@ -734,8 +770,9 @@ export async function getOpenApiEndpointExecutionContext(
   url: string,
   method: string,
   path: string,
+  options: OpenApiDiscoveryOptions = {},
 ): Promise<EndpointExecutionContext> {
-  const resolved = await loadResolvedDocument(url);
+  const resolved = await loadResolvedDocument(url, options);
   const normalizedMethod = normalizeMethod(method);
 
   if (!normalizedMethod) {
@@ -774,6 +811,7 @@ export async function traceParameterUsage(
     includeRequestBodies?: boolean;
     includeResponseBodies?: boolean;
     limit?: number;
+    auth?: OpenApiAuthInput;
   } = {},
 ): Promise<{
   discovery: DiscoverySummary;
@@ -784,7 +822,7 @@ export async function traceParameterUsage(
   totalMatches: number;
   matches: ParameterUsageMatch[];
 }> {
-  const resolved = await loadResolvedDocument(url);
+  const resolved = await loadResolvedDocument(url, { auth: options.auth });
   const normalizedMethod = normalizeMethod(options.method);
   const matches: ParameterUsageMatch[] = [];
   const includeRequestBodies = options.includeRequestBodies ?? true;
@@ -923,13 +961,14 @@ export async function findRelatedEndpoints(
   path: string,
   options: {
     limit?: number;
+    auth?: OpenApiAuthInput;
   } = {},
 ): Promise<{
   discovery: DiscoverySummary;
   source: EndpointDetail;
   relatedEndpoints: RelatedEndpointMatch[];
 }> {
-  const resolved = await loadResolvedDocument(url);
+  const resolved = await loadResolvedDocument(url, { auth: options.auth });
   const normalizedMethod = normalizeMethod(method);
 
   if (!normalizedMethod) {
@@ -1860,7 +1899,11 @@ async function loadResolvedDocumentBySpecId(
 ): Promise<ResolvedDocument | undefined> {
   const cached = specCache.get(specId);
   if (cached) {
-    return loadResolvedDocument(cached.normalizedInput);
+    return loadResolvedDocumentFromCacheKey(
+      cached.cacheKey,
+      cached.normalizedInput,
+      createDiscoveryFetchContext(cached.normalizedInput),
+    );
   }
 
   const persisted = await readCachedDocumentBySpecId(specId);
@@ -1868,19 +1911,40 @@ async function loadResolvedDocumentBySpecId(
     return undefined;
   }
 
+  const cacheKey = persisted.cacheKey ?? persisted.normalizedInput;
   hydrateResolvedDocument(
+    cacheKey,
     persisted.normalizedInput,
     persisted.resolved,
     parseCacheTimestamp(persisted.cachedAt),
   );
-  return loadResolvedDocument(persisted.normalizedInput);
+  return loadResolvedDocumentFromCacheKey(
+    cacheKey,
+    persisted.normalizedInput,
+    createDiscoveryFetchContext(persisted.normalizedInput),
+  );
 }
 
 async function loadResolvedDocument(
   inputUrl: string,
+  options: OpenApiDiscoveryOptions = {},
 ): Promise<ResolvedDocument> {
   const normalizedInput = normalizeUserUrl(inputUrl).toString();
-  const cached = documentCache.get(normalizedInput);
+  const fetchContext = createDiscoveryFetchContext(normalizedInput, options);
+  const cacheKey = buildInputCacheKey(normalizedInput, fetchContext);
+  return loadResolvedDocumentFromCacheKey(
+    cacheKey,
+    normalizedInput,
+    fetchContext,
+  );
+}
+
+async function loadResolvedDocumentFromCacheKey(
+  cacheKey: string,
+  normalizedInput: string,
+  fetchContext: DiscoveryFetchContext,
+): Promise<ResolvedDocument> {
+  const cached = documentCache.get(cacheKey);
 
   if (cached) {
     if (cached.pending || !shouldRevalidateCache(cached.lastValidatedAt)) {
@@ -1888,13 +1952,20 @@ async function loadResolvedDocument(
     }
 
     const refreshPromise = cached.promise
-      .then((resolved) => refreshResolvedDocument(normalizedInput, resolved))
+      .then((resolved) =>
+        refreshResolvedDocument(
+          cacheKey,
+          normalizedInput,
+          resolved,
+          fetchContext,
+        ),
+      )
       .catch((error) => {
-        documentCache.delete(normalizedInput);
+        documentCache.delete(cacheKey);
         throw error;
       });
 
-    documentCache.set(normalizedInput, {
+    documentCache.set(cacheKey, {
       promise: refreshPromise,
       lastValidatedAt: cached.lastValidatedAt,
       pending: true,
@@ -1903,22 +1974,32 @@ async function loadResolvedDocument(
     return refreshPromise;
   }
 
-  const persisted = await readCachedDocumentByInput(normalizedInput);
+  const persisted = await readCachedDocumentByInput(cacheKey);
   if (persisted) {
+    const persistedCacheKey = persisted.cacheKey ?? cacheKey;
     hydrateResolvedDocument(
-      normalizedInput,
+      persistedCacheKey,
+      persisted.normalizedInput,
       persisted.resolved,
       parseCacheTimestamp(persisted.cachedAt),
     );
-    return loadResolvedDocument(normalizedInput);
+    return loadResolvedDocumentFromCacheKey(
+      persistedCacheKey,
+      persisted.normalizedInput,
+      fetchContext,
+    );
   }
 
-  const promise = discoverOpenApiDocument(normalizedInput).catch((error) => {
-    documentCache.delete(normalizedInput);
+  const promise = discoverOpenApiDocument(
+    normalizedInput,
+    cacheKey,
+    fetchContext,
+  ).catch((error) => {
+    documentCache.delete(cacheKey);
     throw error;
   });
 
-  documentCache.set(normalizedInput, {
+  documentCache.set(cacheKey, {
     promise,
     lastValidatedAt: Date.now(),
     pending: true,
@@ -1927,33 +2008,48 @@ async function loadResolvedDocument(
 }
 
 async function refreshResolvedDocument(
+  cacheKey: string,
   normalizedInput: string,
   cached: ResolvedDocument,
+  fetchContext: DiscoveryFetchContext,
 ): Promise<ResolvedDocument> {
   try {
     const refreshed = await refreshResolvedDocumentFromCanonicalSource(
+      cacheKey,
       normalizedInput,
       cached,
+      fetchContext,
     );
-    hydrateResolvedDocument(normalizedInput, refreshed, Date.now());
+    hydrateResolvedDocument(cacheKey, normalizedInput, refreshed, Date.now());
     return refreshed;
   } catch {
     try {
-      const rediscovered = await discoverOpenApiDocument(normalizedInput);
-      hydrateResolvedDocument(normalizedInput, rediscovered, Date.now());
+      const rediscovered = await discoverOpenApiDocument(
+        normalizedInput,
+        cacheKey,
+        fetchContext,
+      );
+      hydrateResolvedDocument(
+        cacheKey,
+        normalizedInput,
+        rediscovered,
+        Date.now(),
+      );
       return rediscovered;
     } catch {
-      hydrateResolvedDocument(normalizedInput, cached, Date.now());
+      hydrateResolvedDocument(cacheKey, normalizedInput, cached, Date.now());
       return cached;
     }
   }
 }
 
 async function refreshResolvedDocumentFromCanonicalSource(
+  cacheKey: string,
   normalizedInput: string,
   cached: ResolvedDocument,
+  fetchContext: DiscoveryFetchContext,
 ): Promise<ResolvedDocument> {
-  const fetched = await fetchText(cached.discovery.documentUrl);
+  const fetched = await fetchText(cached.discovery.documentUrl, fetchContext);
   if (!fetched.ok) {
     throw new Error(
       `Canonical OpenAPI document returned ${fetched.status} for ${cached.discovery.documentUrl}`,
@@ -1973,13 +2069,14 @@ async function refreshResolvedDocumentFromCanonicalSource(
     const bundledDoc = await bundleOpenApiDocument(
       fetched.finalUrl,
       directSpec.doc,
+      fetchContext,
     );
 
     if (
       hashOpenApiDocument(bundledDoc) === cachedHash &&
       fetched.finalUrl === cached.discovery.documentUrl
     ) {
-      await persistResolvedDocument(normalizedInput, cached);
+      await persistResolvedDocument(cacheKey, normalizedInput, cached);
       return cached;
     }
 
@@ -1989,8 +2086,9 @@ async function refreshResolvedDocumentFromCanonicalSource(
       directSpec,
       bundledDoc,
       normalizedInput,
+      cacheKey,
     );
-    await persistResolvedDocument(normalizedInput, resolved);
+    await persistResolvedDocument(cacheKey, normalizedInput, resolved);
     return resolved;
   }
 
@@ -2002,7 +2100,7 @@ async function refreshResolvedDocumentFromCanonicalSource(
         fetched.finalUrl === cached.discovery.documentUrl &&
         cached.discovery.source === "inline-html"
       ) {
-        await persistResolvedDocument(normalizedInput, cached);
+        await persistResolvedDocument(cacheKey, normalizedInput, cached);
         return cached;
       }
 
@@ -2012,8 +2110,9 @@ async function refreshResolvedDocumentFromCanonicalSource(
         inlineSpec,
         inlineSpec.doc,
         normalizedInput,
+        cacheKey,
       );
-      await persistResolvedDocument(normalizedInput, resolved);
+      await persistResolvedDocument(cacheKey, normalizedInput, resolved);
       return resolved;
     }
   }
@@ -2057,6 +2156,8 @@ function parseCacheTimestamp(value: string | undefined): number {
 
 async function discoverOpenApiDocument(
   inputUrl: string,
+  cacheKey: string,
+  fetchContext: DiscoveryFetchContext,
 ): Promise<ResolvedDocument> {
   const normalized = normalizeUserUrl(inputUrl);
   const queue = buildInitialCandidates(normalized);
@@ -2073,7 +2174,7 @@ async function discoverOpenApiDocument(
     visited.add(candidate.url);
     tried.push(candidate.url);
 
-    const fetched = await fetchText(candidate.url);
+    const fetched = await fetchText(candidate.url, fetchContext);
 
     if (!fetched.ok) {
       continue;
@@ -2084,6 +2185,7 @@ async function discoverOpenApiDocument(
       const bundledDoc = await bundleOpenApiDocument(
         fetched.finalUrl,
         directSpec.doc,
+        fetchContext,
       );
       const resolved = buildResolvedDocument(
         candidate,
@@ -2091,8 +2193,9 @@ async function discoverOpenApiDocument(
         directSpec,
         bundledDoc,
         inputUrl,
+        cacheKey,
       );
-      await persistResolvedDocument(inputUrl, resolved);
+      await persistResolvedDocument(cacheKey, inputUrl, resolved);
       return resolved;
     }
 
@@ -2105,8 +2208,9 @@ async function discoverOpenApiDocument(
           inlineSpec,
           inlineSpec.doc,
           inputUrl,
+          cacheKey,
         );
-        await persistResolvedDocument(inputUrl, resolved);
+        await persistResolvedDocument(cacheKey, inputUrl, resolved);
         return resolved;
       }
 
@@ -2135,6 +2239,7 @@ function buildResolvedDocument(
   parsed: ParseSuccess,
   doc: OpenApiDocument,
   inputUrl: string,
+  cacheKey: string,
 ): ResolvedDocument {
   const specId = buildSpecId(documentUrl);
   const endpoints = extractEndpoints(doc);
@@ -2181,22 +2286,24 @@ function buildResolvedDocument(
     workflowDocuments,
   };
 
-  hydrateResolvedDocument(inputUrl, resolved);
+  hydrateResolvedDocument(cacheKey, inputUrl, resolved);
 
   return resolved;
 }
 
 function hydrateResolvedDocument(
+  cacheKey: string,
   normalizedInput: string,
   resolved: ResolvedDocument,
   lastValidatedAt = Date.now(),
 ): void {
   specCache.set(resolved.specId, {
     normalizedInput,
+    cacheKey,
     resolved,
     lastValidatedAt,
   });
-  documentCache.set(normalizedInput, {
+  documentCache.set(cacheKey, {
     promise: Promise.resolve(resolved),
     lastValidatedAt,
     pending: false,
@@ -2204,9 +2311,9 @@ function hydrateResolvedDocument(
 }
 
 async function readCachedDocumentByInput(
-  normalizedInput: string,
+  cacheKey: string,
 ): Promise<CachedDocumentRecord | undefined> {
-  return readCachedDocument(getInputCacheFilePath(normalizedInput));
+  return readCachedDocument(getInputCacheFilePath(cacheKey));
 }
 
 async function readCachedDocumentBySpecId(
@@ -2236,6 +2343,7 @@ async function readCachedDocument(
 }
 
 async function persistResolvedDocument(
+  cacheKey: string,
   normalizedInput: string,
   resolved: ResolvedDocument,
 ): Promise<void> {
@@ -2243,6 +2351,7 @@ async function persistResolvedDocument(
     schemaVersion: CACHE_SCHEMA_VERSION,
     cachedAt: new Date().toISOString(),
     normalizedInput,
+    cacheKey,
     resolved,
   };
 
@@ -2251,7 +2360,7 @@ async function persistResolvedDocument(
 
   const serialized = JSON.stringify(cacheRecord);
   await Promise.all([
-    writeFile(getInputCacheFilePath(normalizedInput), serialized, "utf8"),
+    writeFile(getInputCacheFilePath(cacheKey), serialized, "utf8"),
     writeFile(getSpecCacheFilePath(resolved.specId), serialized, "utf8"),
   ]);
 }
@@ -2263,10 +2372,10 @@ function getCacheDirectory(): string {
   );
 }
 
-function getInputCacheFilePath(normalizedInput: string): string {
+function getInputCacheFilePath(cacheKey: string): string {
   return join(
     getCacheDirectory(),
-    `input-${createHash("sha256").update(normalizedInput).digest("hex")}.json`,
+    `input-${createHash("sha256").update(cacheKey).digest("hex")}.json`,
   );
 }
 
@@ -2463,15 +2572,105 @@ function tryParseYaml(text: string): OpenApiDocument | undefined {
   }
 }
 
+function createDiscoveryFetchContext(
+  normalizedInput: string,
+  options: OpenApiDiscoveryOptions = {},
+): DiscoveryFetchContext {
+  return {
+    inputOrigin: new URL(normalizedInput).origin,
+    auth: options.auth,
+    authFingerprint: buildDiscoveryAuthFingerprint(options.auth),
+  };
+}
+
+function buildInputCacheKey(
+  normalizedInput: string,
+  fetchContext: DiscoveryFetchContext,
+): string {
+  if (!fetchContext.authFingerprint) {
+    return normalizedInput;
+  }
+
+  return `${normalizedInput}\n#auth:${fetchContext.authFingerprint}`;
+}
+
+function buildDiscoveryAuthFingerprint(
+  auth: OpenApiAuthInput | undefined,
+): string | undefined {
+  if (!auth || auth.strategy === "none") {
+    return undefined;
+  }
+
+  const effective = getDiscoveryAuthKind(auth);
+  if (!effective && !auth.headers) {
+    return undefined;
+  }
+
+  const payload = {
+    strategy: effective ?? "headers",
+    username: auth.username ? hashSecretMarker(auth.username) : undefined,
+    token: Boolean(auth.token),
+    apiKey: Boolean(auth.apiKey),
+    apiKeyName: auth.apiKeyName,
+    headers: Object.keys(auth.headers ?? {}).sort(),
+  };
+
+  return createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function hashSecretMarker(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function getDiscoveryAuthKind(
+  auth: OpenApiAuthInput,
+): "basic" | "bearer" | "apiKey" | undefined {
+  const strategy = auth.strategy ?? "auto";
+
+  if (strategy === "basic") {
+    return "basic";
+  }
+
+  if (strategy === "bearer") {
+    return "bearer";
+  }
+
+  if (strategy === "apiKey") {
+    return "apiKey";
+  }
+
+  if (strategy !== "auto") {
+    return undefined;
+  }
+
+  if (auth.token) {
+    return "bearer";
+  }
+
+  if (auth.apiKey) {
+    return "apiKey";
+  }
+
+  if (auth.username && auth.password) {
+    return "basic";
+  }
+
+  return undefined;
+}
+
 async function bundleOpenApiDocument(
   documentUrl: string,
   fallbackDoc: OpenApiDocument,
+  fetchContext: DiscoveryFetchContext,
 ): Promise<OpenApiDocument> {
   try {
     const bundled = await SwaggerParser.bundle(documentUrl, {
       resolve: {
-        http: createHttpResolver(),
-        https: createHttpResolver(),
+        http: createHttpResolver(fetchContext),
+        https: createHttpResolver(fetchContext),
       },
     });
 
@@ -2481,7 +2680,7 @@ async function bundleOpenApiDocument(
   }
 }
 
-function createHttpResolver(): {
+function createHttpResolver(fetchContext: DiscoveryFetchContext): {
   order: number;
   canRead: RegExp;
   read(file: { url: string }): Promise<string>;
@@ -2490,7 +2689,7 @@ function createHttpResolver(): {
     order: 1,
     canRead: /^https?:/i,
     async read(file: { url: string }): Promise<string> {
-      const fetched = await fetchText(file.url);
+      const fetched = await fetchText(file.url, fetchContext);
       if (!fetched.ok) {
         throw new Error(`Failed to fetch OpenAPI reference: ${file.url}`);
       }
@@ -2510,19 +2709,25 @@ function isOpenApiRoot(value: OpenApiDocument): boolean {
   return hasVersion && (hasInfo || hasPaths);
 }
 
-async function fetchText(url: string): Promise<FetchedPage> {
+async function fetchText(
+  url: string,
+  fetchContext: DiscoveryFetchContext,
+): Promise<FetchedPage> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
+    const headers = new Headers({
+      Accept: ACCEPT_HEADER,
+      "User-Agent": USER_AGENT,
+    });
+    applyDiscoveryAuthHeaders(url, headers, fetchContext);
+
     const response = await fetch(url, {
       method: "GET",
       redirect: "follow",
       signal: controller.signal,
-      headers: {
-        Accept: ACCEPT_HEADER,
-        "User-Agent": USER_AGENT,
-      },
+      headers,
     });
 
     return {
@@ -2542,6 +2747,56 @@ async function fetchText(url: string): Promise<FetchedPage> {
     };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function applyDiscoveryAuthHeaders(
+  url: string,
+  headers: Headers,
+  fetchContext: DiscoveryFetchContext,
+): void {
+  const auth = fetchContext.auth;
+  if (!auth || auth.strategy === "none") {
+    return;
+  }
+
+  let requestOrigin: string;
+  try {
+    requestOrigin = new URL(url).origin;
+  } catch {
+    return;
+  }
+
+  if (requestOrigin !== fetchContext.inputOrigin) {
+    return;
+  }
+
+  for (const [name, value] of Object.entries(auth.headers ?? {})) {
+    if (value !== undefined && value !== null) {
+      headers.set(name, String(value));
+    }
+  }
+
+  const authKind = getDiscoveryAuthKind(auth);
+  if (authKind === "basic") {
+    if (!auth.username || !auth.password) {
+      return;
+    }
+
+    const encoded = Buffer.from(`${auth.username}:${auth.password}`).toString(
+      "base64",
+    );
+    headers.set("authorization", `Basic ${encoded}`);
+    return;
+  }
+
+  if (authKind === "bearer" && auth.token) {
+    headers.set("authorization", `Bearer ${auth.token}`);
+    return;
+  }
+
+  if (authKind === "apiKey" && auth.apiKey) {
+    headers.set(auth.apiKeyName ?? "X-API-Key", auth.apiKey);
   }
 }
 
